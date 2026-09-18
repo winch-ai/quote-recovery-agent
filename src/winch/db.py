@@ -31,6 +31,17 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_quote_id_at ON events (quote_id, at);
+
+CREATE TABLE IF NOT EXISTS quote_threads (
+    quote_id text PRIMARY KEY,
+    customer_wa_id text,
+    awaiting boolean NOT NULL DEFAULT false,
+    closed boolean NOT NULL DEFAULT false,
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_quote_threads_customer_closed ON quote_threads (customer_wa_id, closed);
+CREATE INDEX IF NOT EXISTS idx_quote_threads_awaiting_closed_updated_at ON quote_threads (awaiting, closed, updated_at DESC);
 """
 
 

@@ -1,5 +1,15 @@
 # Task: thread-lookup
 
+## Execution order — READ FIRST
+
+**Write all the files before running any command.** Do not run a pre-flight or
+verification command first. The Postgres test suite takes roughly 35 seconds,
+and a run that spends its first turn waiting on a command exits having produced
+nothing.
+
+Order: write `db.py` changes, then `repository.py` additions, then the test file,
+and only then run the definition-of-done command once.
+
 ## Goal
 Persist the mapping from a WhatsApp number to the quote thread it belongs to, so
 an inbound message can be routed to the right graph thread.
