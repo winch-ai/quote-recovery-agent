@@ -73,45 +73,65 @@ async def collect_contact(state: GraphState, deps: Deps) -> dict:
 
     Quote PDFs usually omit the customer's mobile. Asking is more reliable than
     parsing, and it is one message in a thread the contractor is already in.
+
+    NOTE: this node COMMITS before the interrupt happens in await_contact.
+    LangGraph re-executes a node from the top on every resume, so a side effect
+    placed before interrupt() fires again on each one - the contractor would be
+    prompted repeatedly and the event log would be wrong.
     """
     draft = state["draft"]
     missing = [f for f in ("customer_phone", "customer_name", "quote_total")
                if getattr(draft, f, None) is None]
     await deps.events.write(state["quote_id"], EventType.CONTACT_REQUESTED,
                             {"missing": missing})
+    return {"_missing": missing}
 
+
+async def await_contact(state: GraphState, deps: Deps) -> dict:
+    """Interrupt only. Nothing above the interrupt, so replay is harmless."""
     answer = interrupt({
         "kind": "collect_contact",
-        "missing": missing,
-        "draft": draft.model_dump() if draft else None,
+        "missing": state.get("_missing", []),
+        "draft": state["draft"].model_dump() if state.get("draft") else None,
     })
-
+    draft = state["draft"]
+    allowed = set(type(draft).model_fields)
+    clean = {k: v for k, v in (answer or {}).items() if k in allowed}
     await deps.events.write(state["quote_id"], EventType.CONTACT_COLLECTED,
-                            {"provided": sorted(answer)})
-    merged = draft.model_copy(update=answer) if draft else None
+                            {"provided": sorted(clean)})
+    merged = draft.model_copy(update=clean) if clean else draft
     return {"draft": merged, "status": QuoteStatus.AWAITING_APPROVAL}
 
 
 async def confirm(state: GraphState, deps: Deps) -> dict:
-    """Show the parsed quote and the proposed cadence; wait for approval.
+    """Send the approval prompt. Commits before await_confirm interrupts.
 
-    This is the first of the two human gates. Nothing is scheduled until the
-    contractor says so.
+    approval_prompt_sent is timestamped HERE, once. It is the start of the
+    time-to-approve measurement that the whole pilot exists to produce, so it
+    must not be re-emitted on replay.
     """
     draft = state["draft"]
     await deps.events.write(state["quote_id"], EventType.APPROVAL_PROMPT_SENT,
                             {"total": draft.quote_total})
+    return {}
 
+
+async def await_confirm(state: GraphState, deps: Deps) -> dict:
+    """Interrupt only."""
+    draft = state["draft"]
     decision = interrupt({
         "kind": "confirm_quote",
         "draft": draft.model_dump(),
         "cadence_days": [2, 5, 9],
     })
 
+    if decision.get("edits"):
+        return {"_decision": decision}
+
     if decision.get("approved") is not True:
         await deps.events.write(state["quote_id"], EventType.QUOTE_CLOSED,
                                 {"reason": "not_approved"})
-        return {"status": QuoteStatus.CLOSED}
+        return {"status": QuoteStatus.CLOSED, "_decision": {}}
 
     await deps.events.write(state["quote_id"], EventType.APPROVAL_RECEIVED, {})
     quote = freeze_quote(Quote(
@@ -125,7 +145,26 @@ async def confirm(state: GraphState, deps: Deps) -> dict:
         currency=draft.currency or "GBP",
         expiry_date=draft.expiry_date,
     ))
-    return {"quote": quote, "status": QuoteStatus.ACTIVE}
+    return {"quote": quote, "status": QuoteStatus.ACTIVE, "_decision": {}}
+
+
+async def apply_edits(state: GraphState, deps: Deps) -> dict:
+    """Merge the contractor's corrections into the draft, then re-confirm.
+
+    Only fields present in the edit are touched; an edit is a correction, not a
+    replacement, and silently dropping unmentioned fields would lose data the
+    contractor never asked to change.
+    """
+    edits = (state.get("_decision") or {}).get("edits") or {}
+    draft = state["draft"]
+    allowed = set(type(draft).model_fields)
+    clean = {k: v for k, v in edits.items() if k in allowed}
+    if ignored := set(edits) - allowed:
+        logger.warning("ignoring unknown edit fields for %s: %s",
+                       state["quote_id"], sorted(ignored))
+    await deps.events.write(state["quote_id"], EventType.CONTACT_COLLECTED,
+                            {"edited": sorted(clean)})
+    return {"draft": draft.model_copy(update=clean), "_decision": {}}
 
 
 async def schedule(state: GraphState, deps: Deps) -> dict:
@@ -148,6 +187,19 @@ async def compose(state: GraphState, deps: Deps) -> dict:
 
 
 async def gate(state: GraphState, deps: Deps) -> dict:
+    """Send the send-approval prompt. Commits before await_gate interrupts.
+
+    gate_prompt_sent is the second half of the time-to-approve metric. Emitted
+    once, here, for the same reason as approval_prompt_sent.
+    """
+    index = state["pending_gate_index"]
+    tp = state["touchpoints"][index]
+    await deps.events.write(state["quote_id"], EventType.GATE_PROMPT_SENT,
+                            {"index": index, "template": tp.template_name})
+    return {}
+
+
+async def await_gate(state: GraphState, deps: Deps) -> dict:
     """THE human-in-the-loop gate. Nothing reaches a customer without passing here.
 
     v1 is deliberately a hard interrupt on every single outbound, even though the
@@ -158,8 +210,6 @@ async def gate(state: GraphState, deps: Deps) -> dict:
     """
     index = state["pending_gate_index"]
     tp = state["touchpoints"][index]
-    await deps.events.write(state["quote_id"], EventType.GATE_PROMPT_SENT,
-                            {"index": index, "template": tp.template_name})
 
     decision = interrupt({
         "kind": "approve_send",

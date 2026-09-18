@@ -21,7 +21,7 @@ from langgraph.graph import END, START, StateGraph
 
 from winch import nodes
 from winch.nodes import Deps
-from winch.state import ChannelState, GraphState, TouchpointStatus
+from winch.state import ChannelState, GraphState, QuoteStatus, TouchpointStatus
 from winch.supervisor import Node
 
 
@@ -38,6 +38,7 @@ _NODE_FUNCS = {
     Node.EXTRACT: nodes.extract,
     Node.COLLECT_CONTACT: nodes.collect_contact,
     Node.CONFIRM: nodes.confirm,
+    Node.APPLY_EDITS: nodes.apply_edits,
     Node.SCHEDULE: nodes.schedule,
     Node.COMPOSE: nodes.compose,
     Node.GATE: nodes.gate,
@@ -47,6 +48,11 @@ _NODE_FUNCS = {
     Node.ALERT: nodes.alert,
     Node.ARCHIVE: nodes.archive,
 }
+
+
+AWAIT_CONTACT = "await_contact"
+AWAIT_CONFIRM = "await_confirm"
+AWAIT_GATE = "await_gate"
 
 
 def _entry_for(state: GraphState) -> str:
@@ -61,6 +67,23 @@ def _entry_for(state: GraphState) -> str:
 def _after_extract(state: GraphState) -> str:
     """A failed parse alerts the contractor rather than dying quietly."""
     return Node.COLLECT_CONTACT.value if state.get("draft") else Node.ALERT.value
+
+
+def _after_confirm(state: GraphState) -> str:
+    """An edit loops back through confirmation; a decline ends without scheduling."""
+    if (state.get("_decision") or {}).get("edits"):
+        return Node.APPLY_EDITS.value
+    return END if state.get("status") is QuoteStatus.CLOSED else Node.SCHEDULE.value
+
+
+def _after_triage(state: GraphState) -> str:
+    """An unsubscribe archives; it must not alert the contractor as though the
+    customer had asked a question, and it must skip the remaining touchpoints.
+    Mirrors supervisor._ALWAYS[UNSUBSCRIBE] -> ARCHIVE.
+    """
+    return (Node.ARCHIVE.value
+            if state.get("status") is QuoteStatus.CLOSED
+            else Node.ALERT.value)
 
 
 def _after_gate(state: GraphState) -> str:
@@ -85,6 +108,13 @@ def build_graph(deps: Deps, checkpointer=None):
     builder = StateGraph(GraphState)
     for node, func in _NODE_FUNCS.items():
         builder.add_node(node.value, functools.partial(func, deps=deps))
+    # Interrupt-only nodes. Split out so that the node carrying the side effect
+    # COMMITS first: LangGraph replays a node from the top on resume, so a
+    # prompt sent before interrupt() would be sent again on every resume.
+    for name, func in ((AWAIT_CONTACT, nodes.await_contact),
+                       (AWAIT_CONFIRM, nodes.await_confirm),
+                       (AWAIT_GATE, nodes.await_gate)):
+        builder.add_node(name, functools.partial(func, deps=deps))
 
     builder.add_conditional_edges(START, _entry_for, {
         Node.INGEST.value: Node.INGEST.value,
@@ -98,13 +128,21 @@ def build_graph(deps: Deps, checkpointer=None):
         Node.COLLECT_CONTACT.value: Node.COLLECT_CONTACT.value,
         Node.ALERT.value: Node.ALERT.value,
     })
-    builder.add_edge(Node.COLLECT_CONTACT.value, Node.CONFIRM.value)
-    builder.add_edge(Node.CONFIRM.value, Node.SCHEDULE.value)
+    builder.add_edge(Node.COLLECT_CONTACT.value, AWAIT_CONTACT)
+    builder.add_edge(AWAIT_CONTACT, Node.CONFIRM.value)
+    builder.add_edge(Node.CONFIRM.value, AWAIT_CONFIRM)
+    builder.add_conditional_edges(AWAIT_CONFIRM, _after_confirm, {
+        Node.APPLY_EDITS.value: Node.APPLY_EDITS.value,
+        Node.SCHEDULE.value: Node.SCHEDULE.value,
+        END: END,
+    })
+    builder.add_edge(Node.APPLY_EDITS.value, Node.CONFIRM.value)
     builder.add_edge(Node.SCHEDULE.value, END)
 
     # TICK — note there is no edge into SEND except from GATE.
     builder.add_edge(Node.COMPOSE.value, Node.GATE.value)
-    builder.add_conditional_edges(Node.GATE.value, _after_gate, {
+    builder.add_edge(Node.GATE.value, AWAIT_GATE)
+    builder.add_conditional_edges(AWAIT_GATE, _after_gate, {
         Node.SEND.value: Node.SEND.value, END: END,
     })
     builder.add_conditional_edges(Node.SEND.value, _after_send, {
@@ -113,7 +151,10 @@ def build_graph(deps: Deps, checkpointer=None):
     builder.add_edge(Node.RELAY.value, END)
 
     # INBOUND
-    builder.add_edge(Node.TRIAGE.value, Node.ALERT.value)
+    builder.add_conditional_edges(Node.TRIAGE.value, _after_triage, {
+        Node.ALERT.value: Node.ALERT.value,
+        Node.ARCHIVE.value: Node.ARCHIVE.value,
+    })
     builder.add_edge(Node.ALERT.value, END)
     builder.add_edge(Node.ARCHIVE.value, END)
 

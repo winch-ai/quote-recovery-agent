@@ -15,7 +15,7 @@ from langgraph.types import Command
 
 from winch.compose import ContractorProfile
 from winch.events import EventType
-from winch.graph import Entry, build_graph
+from winch.graph import AWAIT_GATE, Entry, build_graph
 from winch.nodes import Deps
 from winch.protocols import SendResult
 from winch.state import ChannelState, Intent, InboundMessage, QuoteDraft, QuoteStatus
@@ -116,8 +116,8 @@ class TestSafetyProperties:
         _, graph = make()
         edges = graph.get_graph().edges
         into_send = {e.source for e in edges if e.target == Node.SEND.value}
-        assert into_send == {Node.GATE.value}, (
-            f"SEND is reachable from {into_send - {Node.GATE.value}} without a gate"
+        assert into_send == {AWAIT_GATE}, (
+            f"SEND is reachable from {into_send - {AWAIT_GATE}} without a gate"
         )
 
     def test_gate_is_always_preceded_by_compose(self):
@@ -125,6 +125,9 @@ class TestSafetyProperties:
         edges = graph.get_graph().edges
         into_gate = {e.source for e in edges if e.target == Node.GATE.value}
         assert into_gate == {Node.COMPOSE.value}
+        # and the interrupt node is only reachable from the gate that prompts
+        into_await = {e.source for e in edges if e.target == AWAIT_GATE}
+        assert into_await == {Node.GATE.value}
 
     def test_every_supervisor_node_except_idle_exists_in_the_graph(self):
         """Stops the table and the wiring drifting apart."""
@@ -132,6 +135,36 @@ class TestSafetyProperties:
         present = set(graph.get_graph().nodes)
         expected = {n.value for n in Node if n is not Node.IDLE}
         assert expected <= present, f"missing nodes: {expected - present}"
+
+
+class TestLangGraphGotchas:
+    async def test_an_empty_resume_payload_is_ignored(self):
+        """Command(resume={}) does NOT resume - the node interrupts again.
+
+        Pinned because it is silent: the graph looks stuck rather than erroring,
+        and app.py must therefore never construct an empty resume payload.
+        """
+        _, graph = make()
+        state = {"quote_id": "q0", "media_id": "m1", "status": QuoteStatus.DRAFT,
+                 "_entry": Entry.INTAKE}
+        await graph.ainvoke(state, cfg("tg"))
+        again = await graph.ainvoke(Command(resume={}), cfg("tg"))
+        assert again["__interrupt__"][0].value["kind"] == "collect_contact"
+
+    async def test_side_effects_before_an_interrupt_are_not_duplicated(self):
+        """LangGraph replays a node from the top on resume, so the prompt event
+        lives in a node that commits BEFORE the interrupt node runs. If that
+        split is undone, contact_requested fires on every resume and the
+        time-to-approve metric is measured off a duplicated event."""
+        deps, graph = make()
+        state = {"quote_id": "q9", "media_id": "m1", "status": QuoteStatus.DRAFT,
+                 "_entry": Entry.INTAKE}
+        await graph.ainvoke(state, cfg("td"))
+        await graph.ainvoke(Command(resume={}), cfg("td"))          # ignored resume
+        await graph.ainvoke(Command(resume={}), cfg("td"))          # ignored again
+        await graph.ainvoke(Command(resume={"customer_phone": "44770"}), cfg("td"))
+        assert deps.events.types().count(EventType.CONTACT_REQUESTED) == 1
+        assert deps.events.types().count(EventType.APPROVAL_PROMPT_SENT) == 1
 
 
 class TestIntakeFlow:
@@ -143,7 +176,7 @@ class TestIntakeFlow:
         result = await graph.ainvoke(state, cfg("t1"))
         assert result["__interrupt__"][0].value["kind"] == "collect_contact"
 
-        result = await graph.ainvoke(Command(resume={}), cfg("t1"))
+        result = await graph.ainvoke(Command(resume={"customer_phone": "447700900412"}), cfg("t1"))
         assert result["__interrupt__"][0].value["kind"] == "confirm_quote"
 
         final = await graph.ainvoke(Command(resume={"approved": True}), cfg("t1"))
@@ -157,9 +190,12 @@ class TestIntakeFlow:
         state = {"quote_id": "q2", "media_id": "m1", "status": QuoteStatus.DRAFT,
                  "_entry": Entry.INTAKE}
         await graph.ainvoke(state, cfg("t2"))
-        await graph.ainvoke(Command(resume={}), cfg("t2"))
+        await graph.ainvoke(Command(resume={"customer_phone": "447700900412"}), cfg("t2"))
         final = await graph.ainvoke(Command(resume={"approved": False}), cfg("t2"))
         assert final["status"] is QuoteStatus.CLOSED
+        assert deps.channel.freeforms == [], (
+            "an unsubscribe must not ping the contractor like a normal reply"
+        )
         assert deps.queue.scheduled == []
 
     async def test_extraction_failure_alerts_instead_of_dying_quietly(self):
@@ -176,7 +212,7 @@ class TestTickFlow:
         state = {"quote_id": qid, "media_id": "m1", "status": QuoteStatus.DRAFT,
                  "_entry": Entry.INTAKE}
         await graph.ainvoke(state, cfg(thread))
-        await graph.ainvoke(Command(resume={}), cfg(thread))
+        await graph.ainvoke(Command(resume={"customer_phone": "447700900412"}), cfg(thread))
         return await graph.ainvoke(Command(resume={"approved": True}), cfg(thread))
 
     async def test_gate_hold_sends_nothing(self):
@@ -248,3 +284,6 @@ class TestInboundFlow:
             cfg("t8"),
         )
         assert final["status"] is QuoteStatus.CLOSED
+        assert deps.channel.freeforms == [], (
+            "an unsubscribe must not ping the contractor like a normal reply"
+        )

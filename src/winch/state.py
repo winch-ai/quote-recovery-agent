@@ -141,3 +141,11 @@ class GraphState(TypedDict, total=False):
     pending_gate_index: int | None
     media_id: str | None
     media_mime: str | None
+
+    # Transient, per-invocation. Declared because LangGraph drops any key the
+    # state schema does not name, silently.
+    _entry: str
+    _media: bytes
+    _variables: list[str]
+    _decision: dict
+    _missing: list[str]
