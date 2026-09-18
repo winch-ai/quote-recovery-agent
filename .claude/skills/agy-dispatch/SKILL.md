@@ -22,6 +22,16 @@ back wrong in a way that is expensive to detect:
 5. **No design decisions remain.** If the brief contains a choice the worker has to make, make it
    yourself first and put the answer in the contract.
 
+## Always include an execution-order instruction
+
+A brief whose task involves slow commands needs an explicit
+**"write all files before running anything"** line. Observed twice: the worker
+spends its single turn launching a verification command, goes idle, and the
+harness terminates it — `status: SUCCESS`, `num_turns: 1`, zero files written.
+
+Name the slow command and its duration in the brief so the worker does not
+front-load it.
+
 ## Launch
 
 ```bash
