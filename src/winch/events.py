@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 
 class EventType(StrEnum):
@@ -32,6 +32,7 @@ class EventType(StrEnum):
     LLM_CALL = "llm_call"                          # token tracing
 
 
+@runtime_checkable
 class EventSink(Protocol):
     async def write(
         self,
