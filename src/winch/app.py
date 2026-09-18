@@ -302,7 +302,17 @@ async def _route_event(runtime: Runtime, settings: Settings, event: ParsedEvent)
         logger.info("contractor reply: %r", (event.text or event.button_payload or "")[:60])
         thread = await _pending_thread(runtime, event.from_wa_id, event.reply_to_message_id)
         if thread is None:
-            logger.info("contractor message with no pending interrupt; ignoring")
+            # Nothing to resume is a normal outcome, but leaving a direct
+            # message unanswered is not - a contractor typing "are you there?"
+            # and hearing nothing back is indistinguishable from the product
+            # being broken, which is exactly the failure mode this whole
+            # product exists to prevent for THEIR customers. Say something.
+            logger.info("contractor message with no pending interrupt; acknowledging")
+            await runtime.contractor_channel.send_freeform(
+                event.from_wa_id,
+                "Nothing outstanding right now - forward a quote whenever "
+                "you're ready and I'll take it from there.",
+            )
             return
         result = await runtime.graph.ainvoke(
             Command(resume=_parse_contractor_reply(event)),

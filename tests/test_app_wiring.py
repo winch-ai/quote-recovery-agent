@@ -873,7 +873,10 @@ class TestErrorVisibilitySafetyNet:
             await _handle(runtime, settings, event)
 
     async def test_success_path_sends_no_apology(self, monkeypatch):
-        """The safety net must not fire on the happy path."""
+        """The safety net specifically (an apology for an unhandled exception)
+        must not fire on the happy path - a normal 'nothing pending'
+        acknowledgment is not an apology and is expected. See
+        TestContractorMessageWithNothingPending for that behaviour."""
         from winch.app import _handle
         from winch.webhook import ParsedEvent
         from datetime import datetime, timezone
@@ -894,7 +897,7 @@ class TestErrorVisibilitySafetyNet:
                 return None
 
             async def pending_thread(self):
-                return None  # "no pending interrupt; ignoring" - a normal outcome
+                return None  # nothing pending - a normal outcome
 
         runtime.contractor_channel = FakeContractorChannel()
         runtime.contact_window = FakeContactWindow()
@@ -904,4 +907,62 @@ class TestErrorVisibilitySafetyNet:
                            from_wa_id="447700900555", text="random chatter",
                            timestamp=datetime.now(timezone.utc))
         await _handle(runtime, settings, event)
-        assert sent == []
+        assert not any("went wrong" in body.lower() for _, body in sent)
+
+
+class TestContractorMessageWithNothingPending:
+    """A contractor message ('are you there?', 'did you do it?') that does
+    not correspond to any pending interrupt was previously silently ignored -
+    no error, no acknowledgment, nothing. Observed directly: two real
+    messages sent in a row got zero response, indistinguishable from the
+    product being broken. Reserve true silence for cases with nothing useful
+    to say; a direct message always deserves an answer.
+    """
+
+    def _runtime_and_settings(self, monkeypatch):
+        for k, v in {
+            "AZURE_OPENAI_ENDPOINT": "https://e.openai.azure.com",
+            "AZURE_OPENAI_API_KEY": "k", "LLM_MODEL": "azure_openai:m",
+            "CONTRACTOR_WA_ID": "447700900555",
+        }.items():
+            monkeypatch.setenv(k, v)
+        from winch.app import Runtime
+        from winch.config import Settings
+        settings = Settings.from_env()
+        return Runtime(settings), settings
+
+    async def test_a_message_with_nothing_pending_gets_acknowledged(self, monkeypatch):
+        from winch.app import _handle
+        from winch.webhook import ParsedEvent
+        from datetime import datetime, timezone
+
+        runtime, settings = self._runtime_and_settings(monkeypatch)
+        sent = []
+
+        class FakeContractorChannel:
+            async def send_freeform(self, to, body):
+                sent.append((to, body))
+
+        class FakeContactWindow:
+            async def record_inbound(self, wa_id):
+                pass
+
+        class FakeThreads:
+            async def resolve_reply(self, reply_to_message_id):
+                return None
+
+            async def pending_thread(self):
+                return None
+
+        runtime.contractor_channel = FakeContractorChannel()
+        runtime.contact_window = FakeContactWindow()
+        runtime.threads = FakeThreads()
+
+        event = ParsedEvent(kind="message", provider_message_id="wamid.chat1",
+                           from_wa_id="447700900555", text="are you there?",
+                           timestamp=datetime.now(timezone.utc))
+        await _handle(runtime, settings, event)
+
+        assert len(sent) == 1
+        assert sent[0][0] == "447700900555"
+        assert "nothing outstanding" in sent[0][1].lower()
