@@ -25,6 +25,7 @@ class EventType(StrEnum):
     TOUCHPOINT_SENT = "touchpoint_sent"
     DELIVERY_CONFIRMED = "delivery_confirmed"
     CHANNEL_UNAVAILABLE = "channel_unavailable"   # drives the build-email-or-not decision
+    TOUCHPOINT_SEND_FAILED = "touchpoint_send_failed"  # generic (non-131026) send failure
     RELAYED_TO_CONTRACTOR = "relayed_to_contractor"
     CUSTOMER_REPLIED = "customer_replied"
     SEQUENCE_HALTED = "sequence_halted"

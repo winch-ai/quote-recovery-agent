@@ -322,8 +322,31 @@ async def send(state: GraphState, deps: Deps) -> dict:
         return {"touchpoints": updated, "channel": ChannelState.WHATSAPP_UNREACHABLE}
 
     if not result.ok:
+        # A generic failure (wrong/unapproved template name, rate limit, auth,
+        # network) previously marked FAILED and returned silently - no event
+        # recorded why, no message to the contractor. From their side this is
+        # indistinguishable from the message having actually gone out: they
+        # approved a send, believed it happened, and heard nothing to say
+        # otherwise. Exactly the trust-destroying silence this whole product
+        # exists to prevent for THEIR customers, happening to the contractor
+        # instead. Found in production: a 404 from an unapproved template name
+        # (checkin_soft had never been submitted) produced total silence.
+        await deps.events.write(state["quote_id"], EventType.TOUCHPOINT_SEND_FAILED,
+                                {"index": index, "template": tp.template_name,
+                                 "error_code": result.error_code})
         updated[index] = tp.model_copy(update={"status": TouchpointStatus.FAILED})
         await deps.queue.mark(state["quote_id"], index, TouchpointStatus.FAILED)
+        try:
+            await deps.contractor_channel.send_freeform(
+                deps.contractor.wa_id,
+                f"Couldn't send the {tp.template_name} message to "
+                f"{quote.customer_name if quote else 'the customer'} - something "
+                f"failed on my end (not a 'not on WhatsApp' issue, a real error). "
+                f"I've logged it; you may need to check the template or try again.",
+            )
+        except Exception:
+            logger.exception("also failed to notify contractor of send failure "
+                             "for %s/%s", state["quote_id"], index)
         return {"touchpoints": updated}
 
     await deps.events.write(state["quote_id"], EventType.TOUCHPOINT_SENT,

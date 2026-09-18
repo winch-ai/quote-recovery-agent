@@ -432,6 +432,32 @@ class TestTickFlow:
         assert EventType.RELAYED_TO_CONTRACTOR in deps.events.types()
         assert deps.channel.freeforms, "contractor was not given the text to send"
 
+    async def test_generic_send_failure_notifies_the_contractor_not_silence(self):
+        """Reproduces a real production incident: the actual template send
+        returned HTTP 404 (the template had never been submitted/approved),
+        result.ok was False but unreachable was False - a generic failure,
+        not a 131026 'not on WhatsApp' signal. The old code marked the
+        touchpoint FAILED and returned with zero notification: no event
+        recording why, nothing sent to the contractor. They had just replied
+        YES to the gate, believed the message went out, and heard nothing
+        to say otherwise - indistinguishable from success.
+        """
+        channel = FakeChannel(SendResult(ok=False, error_code=404, unreachable=False))
+        deps, graph = make(channel=channel)
+        await self._approved_quote(graph, "t7", "q7")
+        await graph.ainvoke({"_entry": Entry.TICK, "pending_gate_index": 0}, cfg("t7"))
+        final = await graph.ainvoke(Command(resume={"text": "yes"}), cfg("t7"))
+
+        assert EventType.TOUCHPOINT_SEND_FAILED in deps.events.types()
+        assert deps.channel.freeforms, (
+            "a generic send failure must notify the contractor, not fail silently"
+        )
+        body = deps.channel.freeforms[-1][1].lower()
+        assert "couldn't send" in body or "failed" in body
+        # must not falsely claim the customer is unreachable on WhatsApp -
+        # that is a specific, narrower claim reserved for error 131026.
+        assert "not on whatsapp" not in body or "not a" in body
+
 
 class TestInboundFlow:
     async def test_customer_reply_halts_and_alerts(self):
