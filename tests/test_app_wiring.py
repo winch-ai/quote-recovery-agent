@@ -60,3 +60,59 @@ class TestSettingsSafety:
         for secret in ("azure-secret", "meta-secret", "app-secret",
                        "verify-secret", "dbsecret"):
             assert secret not in text
+
+
+class TestTickAuth:
+    """Cloud Run auth is per-service, so /internal/tick is public whenever the
+    webhook is. The shared secret is the only thing protecting it."""
+
+    def _app(self, monkeypatch, tick_secret):
+        for k, v in {
+            "AZURE_OPENAI_ENDPOINT": "https://e.openai.azure.com",
+            "AZURE_OPENAI_API_KEY": "k", "LLM_MODEL": "azure_openai:m",
+        }.items():
+            monkeypatch.setenv(k, v)
+        if tick_secret is not None:
+            monkeypatch.setenv("TICK_SECRET", tick_secret)
+        from winch.app import Runtime, _internal_router
+        from winch.config import Settings
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        settings = Settings.from_env()
+        runtime = Runtime(settings)
+
+        class _EmptyQueue:
+            async def claim_due(self, now, limit=20):
+                return []
+
+        runtime.queue = _EmptyQueue()   # auth is what is under test, not draining
+        app = FastAPI()
+        app.include_router(_internal_router(runtime, settings))
+        return TestClient(app)
+
+    def test_correct_secret_is_accepted(self, monkeypatch):
+        client = self._app(monkeypatch, "s3cret")
+        resp = client.post("/internal/tick", headers={"X-Tick-Secret": "s3cret"})
+        assert resp.status_code == 200
+        assert resp.json() == {"claimed": 0}
+
+    def test_wrong_secret_is_rejected(self, monkeypatch):
+        client = self._app(monkeypatch, "s3cret")
+        assert client.post("/internal/tick",
+                           headers={"X-Tick-Secret": "wrong"}).status_code == 403
+
+    def test_missing_header_is_rejected(self, monkeypatch):
+        client = self._app(monkeypatch, "s3cret")
+        assert client.post("/internal/tick").status_code == 403
+
+    def test_unset_secret_rejects_everything(self, monkeypatch):
+        """Fails closed: a misconfigured deploy is inert, not wide open."""
+        monkeypatch.delenv("TICK_SECRET", raising=False)
+        client = self._app(monkeypatch, None)
+        assert client.post("/internal/tick").status_code == 403
+        assert client.post("/internal/tick",
+                           headers={"X-Tick-Secret": ""}).status_code == 403
+
+    def test_healthz_needs_no_secret(self, monkeypatch):
+        client = self._app(monkeypatch, "s3cret")
+        assert client.get("/healthz").status_code == 200

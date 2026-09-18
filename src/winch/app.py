@@ -6,11 +6,12 @@ winch.supervisor and the flow lives in winch.graph.
 """
 from __future__ import annotations
 
+import hmac
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, FastAPI
+from fastapi import APIRouter, FastAPI, Header, Response
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.types import Command
 
@@ -150,7 +151,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         deduplicator=runtime.deduplicator,
         on_event=on_event,
     ))
-    app.include_router(_internal_router(runtime))
+    app.include_router(_internal_router(runtime, settings))
     return app
 
 
@@ -238,7 +239,7 @@ async def _thread_for_customer(runtime: Runtime, wa_id: str) -> str | None:
     return await runtime.threads.thread_for_customer(wa_id)
 
 
-def _internal_router(runtime: Runtime) -> APIRouter:
+def _internal_router(runtime: Runtime, settings: Settings) -> APIRouter:
     router = APIRouter()
 
     @router.get("/healthz")
@@ -246,12 +247,26 @@ def _internal_router(runtime: Runtime) -> APIRouter:
         return {"ok": True}
 
     @router.post("/internal/tick")
-    async def tick() -> dict:
+    async def tick(
+        response: Response,
+        x_tick_secret: str = Header(default=""),
+    ) -> dict:
         """Drain the durable queue. Cloud Scheduler calls this every 5 minutes.
 
         claim_due is atomic under concurrency, so several instances ticking at
         once cannot claim the same touchpoint.
+
+        Fails closed: an unset TICK_SECRET rejects everything rather than
+        accepting everything, so a misconfigured deploy is inert instead of
+        wide open.
         """
+        if not settings.tick_secret or not hmac.compare_digest(
+            x_tick_secret, settings.tick_secret
+        ):
+            logger.warning("tick rejected: bad or missing X-Tick-Secret")
+            response.status_code = 403
+            return {"error": "forbidden"}
+
         now = datetime.now(timezone.utc)
         claimed = await runtime.queue.claim_due(now)
         for due in claimed:

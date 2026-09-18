@@ -36,6 +36,11 @@ class Settings:
 
     database_url: str = field(default="", repr=False)   # contains a password
 
+    # Cloud Run auth is per-service, not per-path. The service must be public so
+    # Meta can reach the webhook, which means /internal/tick is public too. This
+    # shared secret is what keeps it from being a free DoS handle.
+    tick_secret: str = field(default="", repr=False)
+
     # The single contractor this instance serves. v1 is deliberately not
     # multi-tenant; see docs/DESIGN.md.
     contractor_wa_id: str = ""
@@ -60,6 +65,7 @@ class Settings:
             meta_verify_token=os.environ.get("META_VERIFY_TOKEN", ""),
             meta_graph_version=os.environ.get("META_GRAPH_VERSION", "v23.0"),
             database_url=os.environ.get("DATABASE_URL", ""),
+            tick_secret=os.environ.get("TICK_SECRET", ""),
             contractor_wa_id=os.environ.get("CONTRACTOR_WA_ID", ""),
             contractor_first_name=os.environ.get("CONTRACTOR_FIRST_NAME", ""),
             contractor_business_name=os.environ.get("CONTRACTOR_BUSINESS_NAME", ""),
