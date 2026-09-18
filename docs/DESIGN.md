@@ -120,11 +120,32 @@ LLM work concentrates in four specialist sub-agents:
 | `send` | Dispatch via `ChannelAdapter` | — |
 | `observe` | Delivery webhook or timeout → channel resolution | — |
 | `relay` | v1 fallback: hand drafted text to contractor to send themselves | — |
+
+**Interrupt nodes are split from the nodes that prompt.** LangGraph re-executes a
+node from the top on every resume, so a side effect placed before `interrupt()`
+fires again on each one. Each gate is therefore two nodes: one that performs the
+side effect and *commits*, and one that only interrupts —
+`collect_contact`/`await_contact`, `confirm`/`await_confirm`, `gate`/`await_gate`.
+
+This is not cosmetic. `approval_prompt_sent` and `gate_prompt_sent` are the start
+of the time-to-approve measurement the pilot exists to produce; emitting them on
+replay would silently corrupt the only number that matters.
+
+**`Command(resume={})` is ignored.** An empty payload does not resume — the node
+interrupts again and the graph looks stuck rather than erroring. Nothing may
+construct an empty resume payload; pinned by `test_app_wiring.py`.
 | `triage` | Inbound customer reply → intent | yes |
 | `alert` | Halt sequence, tap-to-call / reply link to contractor | — |
 | `archive` | Terminal state | — |
 
-Intents: `QUESTION_ON_TIMELINE | PRICE_OBJECTION | ACCEPTED | TECHNICAL_SCOPE_QUERY | UNSUBSCRIBE`.
+Intents: `QUESTION_ON_TIMELINE | PRICE_OBJECTION | ACCEPTED | TECHNICAL_SCOPE_QUERY |
+UNSUBSCRIBE | UNCLEAR`. The classifier prefers `UNCLEAR` to a wrong guess — a
+misrouted reply is worse than an unclassified one, because the contractor reads
+every unclassified reply anyway.
+
+An unsubscribe routes to `archive`, not `alert`: it must not ping the contractor
+as though the customer asked a question, and it must skip the remaining
+touchpoints.
 
 ### Gate design — deliberately strict for v1
 
@@ -168,14 +189,29 @@ approved / vetoed / never answered. This is the reason we are building rather th
 
 Scale-to-zero is fine — the scheduler wakes the service.
 
+## 7b. Template variables are filled in code
+
+Every variable an approved template takes — customer name, contractor name,
+business name, project title, total — already exists in frozen state or config.
+None of them needs a model, so `winch.compose.build_template_variables` is pure.
+A model cannot hallucinate a price it is never asked to produce.
+
+The LLM composer (`compose_reply`) exists only for free-form replies inside an
+open 24-hour window, and its output passes `guard_freeform` before it can be
+sent.
+
 ## 8. Models
 
-Claude via **Amazon Bedrock** using the `AnthropicBedrockMantle` client. Bedrock model IDs take an
-`anthropic.` prefix. Both Extractor and Triage go through one `LLMClient` wrapper so the Bedrock
-config slots in at a single point.
+**Azure OpenAI**, `gpt-4-1-mini`, via the existing deployment. Verified empirically before building
+on it: chat, vision, and strict `json_schema` all work, and the extraction eval passes every trap
+fixture (`scripts/probe_azure.py`, `scripts/eval_extraction.py`).
 
-> Pending: user's Bedrock configuration. Verify structured-output support on that deployment when
-> wiring — feature availability differs from the first-party API.
+**Azure OpenAI accepts images, not PDFs**, so quotes are rasterised with `pdftoppm` first. This is a
+pipeline dependency the Anthropic API would not have needed, and it is why `poppler-utils` is
+installed in the Dockerfile.
+
+Both Extractor and Triage go through one `LLMClient` wrapper, so a provider change lands in a single
+place.
 
 ## 9. Open items
 
