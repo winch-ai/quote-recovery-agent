@@ -24,6 +24,7 @@ from winch.nodes import Deps, new_quote_id
 from winch.repository import (
     PostgresDeduplicator,
     PostgresEventSink,
+    PostgresThreadIndex,
     PostgresTouchpointQueue,
 )
 from winch.state import InboundMessage, QuoteStatus
@@ -42,6 +43,7 @@ class Runtime:
         self.deduplicator = None
         self.queue = None
         self.events = None
+        self.threads = None
 
     async def start(self) -> None:
         s = self.settings
@@ -51,6 +53,7 @@ class Runtime:
         self.queue = PostgresTouchpointQueue(self.pool)
         self.events = PostgresEventSink(self.pool)
         self.deduplicator = PostgresDeduplicator(self.pool)
+        self.threads = PostgresThreadIndex(self.pool)
 
         channel = WhatsAppChannel(
             phone_number_id=s.meta_phone_number_id,
@@ -160,6 +163,7 @@ async def _handle(runtime: Runtime, settings: Settings, event: ParsedEvent) -> N
 
     if from_contractor and event.media_id:
         quote_id = new_quote_id()
+        await runtime.threads.mark_awaiting(quote_id, True)
         await runtime.graph.ainvoke(
             {"quote_id": quote_id, "media_id": event.media_id,
              "status": QuoteStatus.DRAFT, "_entry": Entry.INTAKE},
@@ -177,6 +181,7 @@ async def _handle(runtime: Runtime, settings: Settings, event: ParsedEvent) -> N
             Command(resume=_parse_contractor_reply(event)),
             {"configurable": {"thread_id": thread}},
         )
+        await _sync_thread_index(runtime, thread)
         return
 
     thread = await _thread_for_customer(runtime, event.from_wa_id)
@@ -194,6 +199,24 @@ async def _handle(runtime: Runtime, settings: Settings, event: ParsedEvent) -> N
     )
 
 
+async def _sync_thread_index(runtime: Runtime, thread: str) -> None:
+    """Keep the index in step with the graph after a resume.
+
+    Binds the customer's number once a quote is approved (that is when we first
+    have it), clears the awaiting flag when nothing is parked, and closes the
+    thread when the quote is finished.
+    """
+    snapshot = await runtime.graph.aget_state({"configurable": {"thread_id": thread}})
+    values = snapshot.values or {}
+    quote = values.get("quote")
+    if quote is not None and quote.customer_phone:
+        await runtime.threads.bind_customer(thread, quote.customer_phone)
+    if values.get("status") == QuoteStatus.CLOSED:
+        await runtime.threads.close(thread)
+        return
+    await runtime.threads.mark_awaiting(thread, bool(snapshot.next))
+
+
 def _parse_contractor_reply(event: ParsedEvent) -> dict:
     """Map a button tap or a plain reply onto a resume payload."""
     payload = (event.button_payload or event.text or "").strip().lower()
@@ -205,11 +228,14 @@ def _parse_contractor_reply(event: ParsedEvent) -> dict:
 
 
 async def _pending_thread(runtime: Runtime, wa_id: str) -> str | None:
-    raise NotImplementedError("thread lookup — see briefs/thread-lookup.md")
+    """Which thread is waiting on a contractor answer. v1 serves one contractor,
+    so `wa_id` is not yet a discriminator - it is taken for the signature the
+    multi-tenant version will need."""
+    return await runtime.threads.pending_thread()
 
 
 async def _thread_for_customer(runtime: Runtime, wa_id: str) -> str | None:
-    raise NotImplementedError("thread lookup — see briefs/thread-lookup.md")
+    return await runtime.threads.thread_for_customer(wa_id)
 
 
 def _internal_router(runtime: Runtime) -> APIRouter:

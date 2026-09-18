@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import os as _os
+import uuid as _uuid
 import os
 import pytest
 
@@ -21,7 +23,15 @@ def anyio_backend():
 
 @pytest.fixture
 async def pool():
+    _SCHEMA = f"winch_run_{_uuid.uuid4().hex[:10]}"
     p = await make_pool(TEST_DATABASE_URL, min_size=2, max_size=10)
+    async with p.connection() as _c:
+        await _c.execute(f"CREATE SCHEMA IF NOT EXISTS {_SCHEMA}")
+    await p.close()
+    p = await make_pool(
+        TEST_DATABASE_URL + f"?options=-csearch_path%3D{_SCHEMA}",
+        min_size=2, max_size=10,
+    )
     await init_schema(p)
     try:
         yield p
