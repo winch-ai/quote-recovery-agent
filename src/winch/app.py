@@ -208,16 +208,20 @@ async def _handle(runtime: Runtime, settings: Settings, event: ParsedEvent) -> N
 
     if from_contractor and event.media_id:
         quote_id = new_quote_id()
+        logger.info("intake: quote=%s media=%s mime=%s", quote_id,
+                    event.media_id, event.media_mime)
         await runtime.threads.mark_awaiting(quote_id, True)
         await runtime.graph.ainvoke(
             {"quote_id": quote_id, "media_id": event.media_id,
              "status": QuoteStatus.DRAFT, "_entry": Entry.INTAKE},
             {"configurable": {"thread_id": quote_id}},
         )
+        logger.info("intake complete: quote=%s", quote_id)
         return
 
     if from_contractor:
         # A reply from the contractor resumes whichever interrupt is pending.
+        logger.info("contractor reply: %r", (event.text or event.button_payload or "")[:60])
         thread = await _pending_thread(runtime, event.from_wa_id)
         if thread is None:
             logger.info("contractor message with no pending interrupt; ignoring")
@@ -229,6 +233,7 @@ async def _handle(runtime: Runtime, settings: Settings, event: ParsedEvent) -> N
         await _sync_thread_index(runtime, thread)
         return
 
+    logger.info("inbound from customer %s", event.from_wa_id)
     thread = await _thread_for_customer(runtime, event.from_wa_id)
     if thread is None:
         logger.info("inbound from an unknown number; ignoring")
@@ -291,6 +296,42 @@ def _internal_router(runtime: Runtime, settings: Settings) -> APIRouter:
         """Not /healthz: Google's frontend intercepts that path on Cloud Run and
         returns its own 404, so the request never reaches the container."""
         return {"ok": True}
+
+    @router.get("/internal/events")
+    async def events(
+        response: Response,
+        limit: int = 50,
+        x_tick_secret: str = Header(default=""),
+    ) -> dict:
+        """Read the recent event log.
+
+        The event log is the instrument this pilot exists to produce, and it was
+        write-only until now - there was no way to see whether anything had
+        happened. Guarded by the same shared secret as the tick, and it returns
+        event types and metadata, never message bodies or customer contact
+        details.
+        """
+        if not settings.tick_secret or not hmac.compare_digest(
+            x_tick_secret, settings.tick_secret
+        ):
+            response.status_code = 403
+            return {"error": "forbidden"}
+        try:
+            async with runtime.pool.connection() as conn:
+                cur = await conn.execute(
+                    """SELECT at, quote_id, event_type, payload
+                       FROM events ORDER BY at DESC LIMIT %s""",
+                    (min(limit, 200),),
+                )
+                rows = await cur.fetchall()
+        except Exception:
+            logger.exception("event read failed")
+            response.status_code = 500
+            return {"error": "query failed"}
+        return {"events": [
+            {"at": r[0].isoformat(), "quote_id": r[1],
+             "type": r[2], "payload": r[3]} for r in rows
+        ]}
 
     @router.post("/internal/tick")
     async def tick(
