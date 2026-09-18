@@ -64,7 +64,40 @@ done
 gcloud secrets versions add AZURE_OPENAI_API_KEY --data-file=-
 ```
 
+## 3b. IAM on a brand-new project (easy to miss)
+
+A fresh project grants its default compute service account nothing, so the first
+`gcloud run deploy --source` fails with a confusing storage 403 about the build
+source bucket. Grant these once:
+
+```bash
+SA="<PROJECT_NUMBER>-compute@developer.gserviceaccount.com"
+for role in roles/cloudbuild.builds.builder roles/storage.objectAdmin \
+            roles/artifactregistry.writer roles/logging.logWriter \
+            roles/cloudsql.client; do
+  gcloud projects add-iam-policy-binding my-winch-project \
+      --member="serviceAccount:$SA" --role="$role"
+done
+
+# and per-secret access for the runtime
+for s in AZURE_OPENAI_API_KEY META_ACCESS_TOKEN META_APP_SECRET \
+         META_VERIFY_TOKEN TICK_SECRET DATABASE_URL; do
+  gcloud secrets add-iam-policy-binding "$s" --project=my-winch-project \
+      --member="serviceAccount:$SA" --role=roles/secretmanager.secretAccessor
+done
+```
+
 ## 4. Deploy
+
+Use the script — it reads non-secret config from `.env` by an explicit allowlist
+so a stray credential can never become a plain env var:
+
+```bash
+scripts/sync_secrets.sh      # push any changed secret values first
+scripts/deploy.sh
+```
+
+Equivalent raw command:
 
 ```bash
 gcloud run deploy winch \
@@ -88,10 +121,17 @@ which fails closed — see `src/winch/webhook.py`.
 
 ```bash
 gcloud scheduler jobs create http winch-tick \
-    --location=europe-west2 --schedule="*/5 * * * *" \
-    --uri="https://<SERVICE_URL>/internal/tick" --http-method=POST \
-    --oidc-service-account-email=<SA>@my-winch-project.iam.gserviceaccount.com
+    --project=my-winch-project --location=europe-west2 \
+    --schedule="*/5 * * * *" --http-method=POST \
+    --uri="https://<SERVICE_URL>/internal/tick" \
+    --headers="X-Tick-Secret=<value of the TICK_SECRET secret>"
 ```
+
+**The tick endpoint is protected by a shared header, not by IAM.** Cloud Run
+authentication is per-service, not per-path, and the service must be public so
+Meta can reach the webhook — which makes `/internal/tick` public too. An unset
+`TICK_SECRET` rejects every request rather than accepting them, so a
+misconfigured deploy is inert rather than an open DoS handle.
 
 Scale-to-zero is fine — the tick wakes the service. `claim_due` uses
 `FOR UPDATE SKIP LOCKED`, so several instances ticking at once cannot claim the
