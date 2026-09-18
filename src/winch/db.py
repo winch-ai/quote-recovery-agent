@@ -47,6 +47,20 @@ CREATE TABLE IF NOT EXISTS quote_threads (
 
 CREATE INDEX IF NOT EXISTS idx_quote_threads_customer_closed ON quote_threads (customer_wa_id, closed);
 CREATE INDEX IF NOT EXISTS idx_quote_threads_awaiting_closed_updated_at ON quote_threads (awaiting, closed, updated_at DESC);
+
+-- Maps a sent WhatsApp message (the prompt) to the quote it is about, so a
+-- contractor's swipe-reply can be resolved deterministically instead of
+-- guessed as "whichever quote is most recently awaiting". Without this, two
+-- quotes simultaneously awaiting a bare "yes" are indistinguishable and a
+-- reply can silently approve the wrong one - this happened in production
+-- before this table existed.
+CREATE TABLE IF NOT EXISTS prompt_messages (
+    provider_message_id text PRIMARY KEY,
+    quote_id text NOT NULL,
+    sent_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_prompt_messages_quote_id ON prompt_messages (quote_id);
 """
 
 

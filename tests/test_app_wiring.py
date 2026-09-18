@@ -470,16 +470,7 @@ class TestInterruptNotification:
             "draft": {"project_title": "2km stock fencing"},
         })
         assert "2km stock fencing" in text
-        assert "customer_phone" in text
-
-    def test_collect_contact_with_nothing_missing_still_prompts_a_reply(self):
-        from winch.app import _render_interrupt
-
-        text = _render_interrupt({
-            "kind": "collect_contact", "missing": [],
-            "draft": {"project_title": "Fencing"},
-        })
-        assert "Reply anything to continue" in text
+        assert "mobile number" in text
 
     def test_confirm_quote_shows_the_frozen_total_and_asks_to_activate(self):
         from winch.app import _render_interrupt
@@ -494,6 +485,34 @@ class TestInterruptNotification:
         assert "24,504.00" in text
         assert "Mark Henderson" in text
         assert "YES" in text
+
+    def test_confirm_quote_names_the_customer_for_disambiguation(self):
+        """With several quotes in flight, the contractor must be able to tell
+        which one a prompt is about just by reading it - the customer name is
+        the cheapest identifier available."""
+        from winch.app import _render_interrupt
+
+        text = _render_interrupt({
+            "kind": "confirm_quote",
+            "draft": {"quote_total": 1000.0, "currency": "GBP",
+                     "customer_name": "Denise Okafor", "customer_phone": "44700",
+                     "project_title": "Shed"},
+            "cadence_days": [2, 5, 9],
+        })
+        assert "Denise Okafor" in text
+
+    def test_every_gate_nudges_a_swipe_reply(self):
+        """The swipe-reply hint is what lets a bare 'yes' resolve to the exact
+        quote it answers instead of guessing 'most recently awaiting' - which
+        silently approved the wrong quote once two were in flight at once."""
+        from winch.app import _render_interrupt
+
+        for payload in (
+            {"kind": "collect_contact", "missing": ["customer_phone"], "draft": {}},
+            {"kind": "confirm_quote", "draft": {"customer_name": "X"}, "cadence_days": [2]},
+            {"kind": "approve_send", "template": "t", "preview": "p"},
+        ):
+            assert "swipe" in _render_interrupt(payload).lower()
 
     def test_approve_send_shows_the_preview(self):
         from winch.app import _render_interrupt
@@ -512,21 +531,84 @@ class TestInterruptNotification:
 
     async def test_notify_sends_when_the_result_has_an_interrupt(self):
         from winch.app import _notify_contractor_of_interrupt
+        from winch.protocols import SendResult
 
         class FakeInterrupt:
-            value = {"kind": "collect_contact", "missing": [], "draft": {}}
+            value = {"kind": "collect_contact", "missing": ["customer_phone"], "draft": {}}
 
         sent = []
 
         class FakeChannel:
             async def send_freeform(self, to, body):
                 sent.append((to, body))
+                return SendResult(ok=True, provider_message_id="wamid.prompt1")
+
+        class FakeThreads:
+            recorded = []
+            async def record_prompt(self, quote_id, message_id):
+                self.recorded.append((quote_id, message_id))
+
+        class FakeRuntime:
+            threads = FakeThreads()
 
         await _notify_contractor_of_interrupt(
-            None, FakeChannel(), "44770", {"__interrupt__": [FakeInterrupt()]}
+            FakeRuntime(), FakeChannel(), "44770", {"__interrupt__": [FakeInterrupt()]},
+            "q_123",
         )
         assert len(sent) == 1
         assert sent[0][0] == "44770"
+
+    async def test_notify_records_the_prompt_message_id_for_later_disambiguation(self):
+        from winch.app import _notify_contractor_of_interrupt
+        from winch.protocols import SendResult
+
+        class FakeInterrupt:
+            value = {"kind": "confirm_quote", "draft": {}, "cadence_days": []}
+
+        class FakeChannel:
+            async def send_freeform(self, to, body):
+                return SendResult(ok=True, provider_message_id="wamid.prompt42")
+
+        recorded = []
+
+        class FakeThreads:
+            async def record_prompt(self, quote_id, message_id):
+                recorded.append((quote_id, message_id))
+
+        class FakeRuntime:
+            threads = FakeThreads()
+
+        await _notify_contractor_of_interrupt(
+            FakeRuntime(), FakeChannel(), "44770", {"__interrupt__": [FakeInterrupt()]},
+            "q_abc",
+        )
+        assert recorded == [("q_abc", "wamid.prompt42")]
+
+    async def test_a_failed_send_does_not_record_a_prompt(self):
+        from winch.app import _notify_contractor_of_interrupt
+        from winch.protocols import SendResult
+
+        class FakeInterrupt:
+            value = {"kind": "confirm_quote", "draft": {}, "cadence_days": []}
+
+        class FakeChannel:
+            async def send_freeform(self, to, body):
+                return SendResult(ok=False)
+
+        recorded = []
+
+        class FakeThreads:
+            async def record_prompt(self, quote_id, message_id):
+                recorded.append((quote_id, message_id))
+
+        class FakeRuntime:
+            threads = FakeThreads()
+
+        await _notify_contractor_of_interrupt(
+            FakeRuntime(), FakeChannel(), "44770", {"__interrupt__": [FakeInterrupt()]},
+            "q_abc",
+        )
+        assert recorded == []
 
     async def test_notify_sends_nothing_when_the_graph_ran_to_completion(self):
         """A result with no __interrupt__ key means the graph finished or ended
@@ -539,5 +621,78 @@ class TestInterruptNotification:
             async def send_freeform(self, to, body):
                 sent.append((to, body))
 
-        await _notify_contractor_of_interrupt(None, FakeChannel(), "44770", {"status": "CLOSED"})
+        await _notify_contractor_of_interrupt(
+            None, FakeChannel(), "44770", {"status": "CLOSED"}, "q_1"
+        )
         assert sent == []
+
+
+class TestPendingThreadDisambiguation:
+    """The bug reported directly by a real pilot session: with two quotes
+    simultaneously awaiting a contractor answer, replying 'yes' silently
+    approved the WRONG one - the newest, not the one actually being looked at.
+    _pending_thread must prefer an exact resolution from a swipe-reply over
+    the "most recently awaiting" guess.
+    """
+
+    def _runtime(self, monkeypatch):
+        for k, v in {
+            "AZURE_OPENAI_ENDPOINT": "https://e.openai.azure.com",
+            "AZURE_OPENAI_API_KEY": "k", "LLM_MODEL": "azure_openai:m",
+        }.items():
+            monkeypatch.setenv(k, v)
+        from winch.app import Runtime
+        from winch.config import Settings
+        return Runtime(Settings.from_env())
+
+    async def test_swipe_reply_resolves_to_the_exact_quote_not_the_newest(self, monkeypatch):
+        from winch.app import _pending_thread
+
+        runtime = self._runtime(monkeypatch)
+
+        class FakeThreads:
+            async def resolve_reply(self, reply_to_message_id):
+                # Simulates: this prompt id belongs to the OLDER quote, even
+                # though a newer one is also awaiting.
+                return "q_older" if reply_to_message_id == "wamid.prompt_old" else None
+
+            async def pending_thread(self):
+                return "q_newest"  # what the old buggy fallback would return
+
+        runtime.threads = FakeThreads()
+        result = await _pending_thread(runtime, "44770", "wamid.prompt_old")
+        assert result == "q_older", "swipe-reply must win over 'most recently awaiting'"
+
+    async def test_no_reply_context_falls_back_to_most_recently_awaiting(self, monkeypatch):
+        from winch.app import _pending_thread
+
+        runtime = self._runtime(monkeypatch)
+
+        class FakeThreads:
+            async def resolve_reply(self, reply_to_message_id):
+                return None
+
+            async def pending_thread(self):
+                return "q_newest"
+
+        runtime.threads = FakeThreads()
+        result = await _pending_thread(runtime, "44770", None)
+        assert result == "q_newest"
+
+    async def test_reply_to_an_unrecorded_message_falls_back(self, monkeypatch):
+        """A swipe-reply to something that isn't a recorded prompt (e.g. an
+        old status message) must not crash - just fall back."""
+        from winch.app import _pending_thread
+
+        runtime = self._runtime(monkeypatch)
+
+        class FakeThreads:
+            async def resolve_reply(self, reply_to_message_id):
+                return None
+
+            async def pending_thread(self):
+                return "q_fallback"
+
+        runtime.threads = FakeThreads()
+        result = await _pending_thread(runtime, "44770", "wamid.unrelated")
+        assert result == "q_fallback"

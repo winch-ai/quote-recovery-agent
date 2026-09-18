@@ -170,3 +170,46 @@ async def test_two_awaiting_threads_most_recently_updated_wins(pool):
     # Closing quote-1 leaves quote-2 awaiting
     await index.close("quote-1")
     assert await index.pending_thread() == "quote-2"
+
+
+async def test_resolve_reply_returns_none_for_no_reply_context(pool):
+    index = PostgresThreadIndex(pool)
+    assert await index.resolve_reply(None) is None
+
+
+async def test_resolve_reply_returns_none_for_unrecorded_message(pool):
+    index = PostgresThreadIndex(pool)
+    assert await index.resolve_reply("wamid.never-recorded") is None
+
+
+async def test_record_prompt_then_resolve_reply_finds_the_quote(pool):
+    index = PostgresThreadIndex(pool)
+    await index.record_prompt("quote-1", "wamid.prompt-1")
+    assert await index.resolve_reply("wamid.prompt-1") == "quote-1"
+
+
+async def test_two_quotes_awaiting_swipe_reply_resolves_to_the_right_one(pool):
+    """This is the exact production scenario: two quotes both simultaneously
+    awaiting a plain 'yes', and pending_thread() alone cannot tell them apart.
+    resolve_reply() must pick the one the reply actually swiped on, even
+    though it is NOT the most recently awaiting one."""
+    index = PostgresThreadIndex(pool)
+    await index.mark_awaiting("quote-old", True)
+    await asyncio.sleep(0.01)
+    await index.mark_awaiting("quote-new", True)
+    assert await index.pending_thread() == "quote-new"
+
+    await index.record_prompt("quote-old", "wamid.prompt-old")
+    await index.record_prompt("quote-new", "wamid.prompt-new")
+
+    # A swipe-reply to the OLDER prompt must resolve to quote-old, not the
+    # newer one that pending_thread() would have guessed.
+    assert await index.resolve_reply("wamid.prompt-old") == "quote-old"
+    assert await index.resolve_reply("wamid.prompt-new") == "quote-new"
+
+
+async def test_record_prompt_is_idempotent(pool):
+    index = PostgresThreadIndex(pool)
+    await index.record_prompt("quote-1", "wamid.prompt-1")
+    await index.record_prompt("quote-1", "wamid.prompt-1")
+    assert await index.resolve_reply("wamid.prompt-1") == "quote-1"

@@ -88,7 +88,17 @@ async def collect_contact(state: GraphState, deps: Deps) -> dict:
 
 
 async def await_contact(state: GraphState, deps: Deps) -> dict:
-    """Interrupt only. Nothing above the interrupt, so replay is harmless."""
+    """Interrupt only, and only if something is actually missing.
+
+    Previously this always interrupted, even with nothing to ask - which
+    produced a real, observed exchange where the contractor was told "reply
+    anything to continue" for a quote that already had every field, replied
+    with a confused "anything or", and the bot pointlessly waited on it. A
+    quote with nothing missing has no reason to pause the graph at all.
+    """
+    if not state.get("_missing"):
+        return {"status": QuoteStatus.AWAITING_APPROVAL}
+
     answer = interrupt({
         "kind": "collect_contact",
         "missing": state.get("_missing", []),

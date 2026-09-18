@@ -28,6 +28,10 @@ DRAFT = QuoteDraft(
     currency="GBP", expiry_date="2026-10-11",
 )
 
+# Missing the customer's phone - unlike DRAFT, this one legitimately needs the
+# collect_contact interrupt (see nodes.await_contact, which otherwise skips it).
+DRAFT_NO_PHONE = DRAFT.model_copy(update={"customer_phone": None})
+
 
 class FakeLLM:
     def __init__(self, draft=DRAFT, intent=Intent.QUESTION_ON_TIMELINE, fail=False):
@@ -149,6 +153,16 @@ class TestLangGraphGotchas:
                  "_entry": Entry.INTAKE}
         await graph.ainvoke(state, cfg("tg"))
         again = await graph.ainvoke(Command(resume={}), cfg("tg"))
+        assert again["__interrupt__"][0].value["kind"] == "confirm_quote"
+
+    async def test_an_empty_resume_payload_is_ignored_at_collect_contact(self):
+        """Same gotcha, but at the earlier gate - only reachable when something
+        is genuinely missing (see nodes.await_contact)."""
+        _, graph = make(llm=FakeLLM(draft=DRAFT_NO_PHONE))
+        state = {"quote_id": "q0b", "media_id": "m1", "status": QuoteStatus.DRAFT,
+                 "_entry": Entry.INTAKE}
+        await graph.ainvoke(state, cfg("tgb"))
+        again = await graph.ainvoke(Command(resume={}), cfg("tgb"))
         assert again["__interrupt__"][0].value["kind"] == "collect_contact"
 
     async def test_side_effects_before_an_interrupt_are_not_duplicated(self):
@@ -168,15 +182,16 @@ class TestLangGraphGotchas:
 
 
 class TestIntakeFlow:
-    async def test_parks_at_collect_contact_then_at_confirm(self):
+    async def test_a_complete_draft_skips_straight_to_confirm(self):
+        """A quote with nothing missing must not pause at collect_contact at
+        all - see nodes.await_contact. Pausing to ask a no-op question was a
+        real, observed exchange: the contractor was told 'reply anything to
+        continue' for a quote that already had every field."""
         deps, graph = make()
         state = {"quote_id": "q1", "media_id": "m1", "status": QuoteStatus.DRAFT,
                  "_entry": Entry.INTAKE}
 
         result = await graph.ainvoke(state, cfg("t1"))
-        assert result["__interrupt__"][0].value["kind"] == "collect_contact"
-
-        result = await graph.ainvoke(Command(resume={"customer_phone": "447700900412"}), cfg("t1"))
         assert result["__interrupt__"][0].value["kind"] == "confirm_quote"
 
         final = await graph.ainvoke(Command(resume={"approved": True}), cfg("t1"))
@@ -185,12 +200,26 @@ class TestIntakeFlow:
         assert final["quote"].quote_total == 24504.0
         assert len(deps.queue.scheduled) == 1
 
+    async def test_an_incomplete_draft_still_parks_at_collect_contact_first(self):
+        deps, graph = make(llm=FakeLLM(draft=DRAFT_NO_PHONE))
+        state = {"quote_id": "q1b", "media_id": "m1", "status": QuoteStatus.DRAFT,
+                 "_entry": Entry.INTAKE}
+
+        result = await graph.ainvoke(state, cfg("t1b"))
+        assert result["__interrupt__"][0].value["kind"] == "collect_contact"
+        assert result["__interrupt__"][0].value["missing"] == ["customer_phone"]
+
+        result = await graph.ainvoke(Command(resume={"customer_phone": "447700900412"}), cfg("t1b"))
+        assert result["__interrupt__"][0].value["kind"] == "confirm_quote"
+
+        final = await graph.ainvoke(Command(resume={"approved": True}), cfg("t1b"))
+        assert final["quote"].customer_phone == "447700900412"
+
     async def test_declining_closes_without_scheduling(self):
         deps, graph = make()
         state = {"quote_id": "q2", "media_id": "m1", "status": QuoteStatus.DRAFT,
                  "_entry": Entry.INTAKE}
         await graph.ainvoke(state, cfg("t2"))
-        await graph.ainvoke(Command(resume={"customer_phone": "447700900412"}), cfg("t2"))
         final = await graph.ainvoke(Command(resume={"approved": False}), cfg("t2"))
         assert final["status"] is QuoteStatus.CLOSED
         assert deps.channel.freeforms == [], (
@@ -209,10 +238,11 @@ class TestIntakeFlow:
 
 class TestTickFlow:
     async def _approved_quote(self, graph, thread, qid):
+        """DRAFT has every field, so the graph skips collect_contact entirely
+        and interrupts at confirm_quote on the first invoke."""
         state = {"quote_id": qid, "media_id": "m1", "status": QuoteStatus.DRAFT,
                  "_entry": Entry.INTAKE}
         await graph.ainvoke(state, cfg(thread))
-        await graph.ainvoke(Command(resume={"customer_phone": "447700900412"}), cfg(thread))
         return await graph.ainvoke(Command(resume={"approved": True}), cfg(thread))
 
     async def test_gate_hold_sends_nothing(self):

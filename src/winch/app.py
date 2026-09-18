@@ -258,14 +258,14 @@ async def _handle(runtime: Runtime, settings: Settings, event: ParsedEvent) -> N
             {"configurable": {"thread_id": quote_id}},
         )
         await _notify_contractor_of_interrupt(
-            runtime, runtime.contractor_channel, settings.contractor_wa_id, result)
+            runtime, runtime.contractor_channel, settings.contractor_wa_id, result, quote_id)
         logger.info("intake complete: quote=%s", quote_id)
         return
 
     if from_contractor:
         # A reply from the contractor resumes whichever interrupt is pending.
         logger.info("contractor reply: %r", (event.text or event.button_payload or "")[:60])
-        thread = await _pending_thread(runtime, event.from_wa_id)
+        thread = await _pending_thread(runtime, event.from_wa_id, event.reply_to_message_id)
         if thread is None:
             logger.info("contractor message with no pending interrupt; ignoring")
             return
@@ -274,7 +274,7 @@ async def _handle(runtime: Runtime, settings: Settings, event: ParsedEvent) -> N
             {"configurable": {"thread_id": thread}},
         )
         await _notify_contractor_of_interrupt(
-            runtime, runtime.contractor_channel, settings.contractor_wa_id, result)
+            runtime, runtime.contractor_channel, settings.contractor_wa_id, result, thread)
         await _sync_thread_index(runtime, thread)
         return
 
@@ -293,7 +293,7 @@ async def _handle(runtime: Runtime, settings: Settings, event: ParsedEvent) -> N
         {"configurable": {"thread_id": thread}},
     )
     await _notify_contractor_of_interrupt(
-        runtime, runtime.contractor_channel, settings.contractor_wa_id, result)
+        runtime, runtime.contractor_channel, settings.contractor_wa_id, result, thread)
 
 
 def _render_interrupt(payload: dict) -> str:
@@ -304,41 +304,65 @@ def _render_interrupt(payload: dict) -> str:
     ainvoke() result, so a paused graph never told the contractor it was
     waiting on them. From their side that looked identical to nothing having
     happened at all.
+
+    Every message names the customer, so a contractor with several quotes in
+    flight can tell them apart even without swipe-replying - and every message
+    ends with the same nudge to swipe-reply, because that is what lets a bare
+    "yes" be resolved to the exact quote it is about (see
+    app._pending_thread / PostgresThreadIndex.resolve_reply) instead of
+    guessed from "whichever quote is most recently awaiting", which silently
+    approved the wrong quote once two were in flight at the same time.
     """
     kind = payload.get("kind")
+    SWIPE_HINT = "(Swipe to reply on this message so I know which quote you mean.)"
 
     if kind == "collect_contact":
+        # Only reached when something is genuinely missing - see
+        # nodes.await_contact, which skips the interrupt entirely otherwise.
         draft = payload.get("draft") or {}
         missing = payload.get("missing") or []
-        lines = [f"Got it - {draft.get('project_title', 'the quote')}."]
-        if missing:
-            lines.append("Missing: " + ", ".join(missing) + ". Reply with them.")
-        else:
-            lines.append("Reply anything to continue.")
+        readable = {
+            "customer_phone": "their mobile number",
+            "customer_name": "the customer's name",
+            "quote_total": "the total",
+        }
+        asks = ", ".join(readable.get(f, f) for f in missing)
+        lines = [
+            f"Quick one on {draft.get('project_title', 'that quote')} - "
+            f"I couldn't find {asks} on the PDF. Can you send it over?",
+            "",
+            SWIPE_HINT,
+        ]
         return "\n".join(lines)
 
     if kind == "confirm_quote":
         draft = payload.get("draft") or {}
         total = draft.get("quote_total") or 0.0
         currency = draft.get("currency") or ""
+        customer = draft.get("customer_name") or "the customer"
+        phone = draft.get("customer_phone") or "no number given - I'll ask you before sending anything"
         cadence = payload.get("cadence_days") or []
-        cadence_str = "/".join(str(d) for d in cadence)
+        cadence_str = ", ".join(f"day {d}" for d in cadence)
         lines = [
-            f"Parsed quote: {currency} {total:,.2f}",
-            f"Client: {draft.get('customer_name')} ({draft.get('customer_phone') or 'no phone'}).",
-            f"Project: {draft.get('project_title')}",
-            f"Sequence: day {cadence_str} check-ins.",
+            f"Here's what I've got for {customer} - {currency} {total:,.2f} "
+            f"for {draft.get('project_title')}.",
+            f"Contact: {phone}.",
+            f"If you're happy, I'll check in on {cadence_str} - nothing goes "
+            f"out to {customer.split()[0] if customer != 'the customer' else 'them'} "
+            f"without you seeing it first.",
             "",
-            "Reply YES to activate follow-ups, or send corrections.",
+            "Reply YES to start, or tell me what to fix.",
+            SWIPE_HINT,
         ]
         return "\n".join(lines)
 
     if kind == "approve_send":
         lines = [
-            f"Sending [{payload.get('template')}] next:",
-            f"{payload.get('preview')}",
+            f"Ready to send this to your customer ({payload.get('template')}):",
+            f"\"{payload.get('preview')}\"",
             "",
-            "Reply YES to send, or HOLD to skip this one.",
+            "Reply YES to send it, or HOLD to skip this one for now.",
+            SWIPE_HINT,
         ]
         return "\n".join(lines)
 
@@ -346,14 +370,25 @@ def _render_interrupt(payload: dict) -> str:
 
 
 async def _notify_contractor_of_interrupt(runtime: Runtime, deps_channel, wa_id: str,
-                                          result: dict) -> None:
-    """If the invocation paused at interrupt(), tell the contractor. Every
-    graph.ainvoke() call site must route its result through this."""
+                                          result: dict, quote_id: str) -> None:
+    """If the invocation paused at interrupt(), tell the contractor and record
+    which message is the prompt for this quote.
+
+    That record is what lets a later swipe-reply be resolved to the exact
+    quote it answers (see PostgresThreadIndex.resolve_reply) instead of
+    guessed as "whichever quote is most recently awaiting" - which silently
+    approved the wrong quote in production the moment two were in flight.
+    """
     interrupts = result.get("__interrupt__")
     if not interrupts:
         return
     text = _render_interrupt(interrupts[0].value)
-    await deps_channel.send_freeform(wa_id, text)
+    send_result = await deps_channel.send_freeform(wa_id, text)
+    if send_result.ok and send_result.provider_message_id:
+        try:
+            await runtime.threads.record_prompt(quote_id, send_result.provider_message_id)
+        except Exception:
+            logger.exception("failed to record prompt message for %s", quote_id)
 
 
 async def _sync_thread_index(runtime: Runtime, thread: str) -> None:
@@ -384,10 +419,24 @@ def _parse_contractor_reply(event: ParsedEvent) -> dict:
     return {"text": event.text or ""}
 
 
-async def _pending_thread(runtime: Runtime, wa_id: str) -> str | None:
-    """Which thread is waiting on a contractor answer. v1 serves one contractor,
-    so `wa_id` is not yet a discriminator - it is taken for the signature the
-    multi-tenant version will need."""
+async def _pending_thread(runtime: Runtime, wa_id: str,
+                          reply_to_message_id: str | None = None) -> str | None:
+    """Which thread is waiting on a contractor answer.
+
+    v1 serves one contractor, so `wa_id` is not yet a discriminator - it is
+    taken for the signature the multi-tenant version will need.
+
+    Resolution order:
+      1. If the contractor swipe-replied to a specific prompt, resolve to the
+         exact quote that prompt was about - deterministic, no guessing.
+      2. Otherwise fall back to "most recently awaiting", which is only
+         correct when a single quote is in flight. With several
+         simultaneously awaiting a plain "yes", this used to silently resume
+         the wrong one.
+    """
+    resolved = await runtime.threads.resolve_reply(reply_to_message_id)
+    if resolved is not None:
+        return resolved
     return await runtime.threads.pending_thread()
 
 
@@ -470,7 +519,8 @@ def _internal_router(runtime: Runtime, settings: Settings) -> APIRouter:
                     {"configurable": {"thread_id": due.quote_id}},
                 )
                 await _notify_contractor_of_interrupt(
-                    runtime, runtime.contractor_channel, settings.contractor_wa_id, result)
+                    runtime, runtime.contractor_channel, settings.contractor_wa_id, result,
+                    due.quote_id)
             except Exception:
                 logger.exception("tick failed for %s/%s", due.quote_id,
                                  due.touchpoint_index)

@@ -304,7 +304,14 @@ class PostgresThreadIndex:
                 return row[0] if row is not None else None
 
     async def pending_thread(self) -> str | None:
-        """Most recently flagged awaiting, non-closed thread, else None."""
+        """Most recently flagged awaiting, non-closed thread, else None.
+
+        Ambiguous the instant more than one quote is simultaneously awaiting -
+        prefer record_prompt()/resolve_reply() below when the inbound message
+        carries a reply_to_message_id, which resolves deterministically instead
+        of guessing. This remains the fallback for a plain (non-reply) message
+        when exactly one thread is awaiting.
+        """
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
@@ -315,6 +322,44 @@ class PostgresThreadIndex:
                     ORDER BY updated_at DESC
                     LIMIT 1;
                     """
+                )
+                row = await cur.fetchone()
+                return row[0] if row is not None else None
+
+    async def record_prompt(self, quote_id: str, provider_message_id: str) -> None:
+        """Record that this outbound message is the prompt for this quote.
+
+        Call this every time a contractor-facing prompt is sent (a rendered
+        interrupt payload). It is what lets a swipe-reply be resolved to the
+        exact quote it answers, rather than "whichever quote is most recently
+        awaiting" - the latter silently approved the wrong quote in production
+        the moment two were in flight at once.
+        """
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO prompt_messages (provider_message_id, quote_id, sent_at)
+                    VALUES (%s, %s, now())
+                    ON CONFLICT (provider_message_id) DO NOTHING;
+                    """,
+                    (provider_message_id, quote_id),
+                )
+
+    async def resolve_reply(self, reply_to_message_id: str | None) -> str | None:
+        """Look up the quote a swipe-reply is about, if it was a reply at all.
+
+        Returns None when reply_to_message_id is None (not a reply) or the id
+        is not one we recorded a prompt for - the caller falls back to
+        pending_thread() in that case.
+        """
+        if not reply_to_message_id:
+            return None
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT quote_id FROM prompt_messages WHERE provider_message_id = %s;",
+                    (reply_to_message_id,),
                 )
                 row = await cur.fetchone()
                 return row[0] if row is not None else None

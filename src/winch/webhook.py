@@ -83,6 +83,7 @@ class ParsedEvent(BaseModel):
     media_id: str | None = None
     media_mime: str | None = None
     button_payload: str | None = None
+    reply_to_message_id: str | None = None  # set when the user swipe-replies
     status: str | None = None  # sent|delivered|read|failed
     error_code: int | None = None  # e.g. 131026
     timestamp: datetime
@@ -125,6 +126,14 @@ def _parse_message(message: dict[str, Any]) -> ParsedEvent | None:
     ts = _parse_timestamp(message.get("timestamp"))
     msg_type = message.get("type")
 
+    # Meta sets `context.id` to the message being replied to when the user
+    # swipe-replies. Used to resolve which quote a bare "yes" is about when
+    # several are simultaneously awaiting a contractor answer - see
+    # app._pending_thread. Absent on a plain (non-reply) message.
+    context = message.get("context")
+    reply_to = context.get("id") if isinstance(context, dict) else None
+    reply_to = str(reply_to) if reply_to is not None else None
+
     try:
         if msg_type == "text":
             text_obj = message.get("text")
@@ -134,6 +143,7 @@ def _parse_message(message: dict[str, Any]) -> ParsedEvent | None:
                 provider_message_id=msg_id,
                 from_wa_id=from_wa_id,
                 text=text,
+                reply_to_message_id=reply_to,
                 timestamp=ts,
             )
 
@@ -151,6 +161,7 @@ def _parse_message(message: dict[str, Any]) -> ParsedEvent | None:
                 media_id=media_id,
                 media_mime=media_mime,
                 text=caption,
+                reply_to_message_id=reply_to,
                 timestamp=ts,
             )
 
@@ -168,6 +179,7 @@ def _parse_message(message: dict[str, Any]) -> ParsedEvent | None:
                 media_id=media_id,
                 media_mime=media_mime,
                 text=caption,
+                reply_to_message_id=reply_to,
                 timestamp=ts,
             )
 
@@ -196,6 +208,7 @@ def _parse_message(message: dict[str, Any]) -> ParsedEvent | None:
                     from_wa_id=from_wa_id,
                     button_payload=button_payload,
                     text=text,
+                    reply_to_message_id=reply_to,
                     timestamp=ts,
                 )
             return None
@@ -220,6 +233,7 @@ def _parse_message(message: dict[str, Any]) -> ParsedEvent | None:
                 from_wa_id=from_wa_id,
                 button_payload=button_payload,
                 text=text,
+                reply_to_message_id=reply_to,
                 timestamp=ts,
             )
 
