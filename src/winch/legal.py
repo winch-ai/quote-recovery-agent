@@ -91,6 +91,49 @@ immediately and contacted no further.</p>
 <footer>This page is served by the application itself and reflects what the
 software actually does.</footer>""")
 
+    @router.get("/data-deletion", response_class=HTMLResponse)
+    async def data_deletion() -> str:
+        """Meta requires a Data Deletion Instructions URL before an app goes Live.
+
+        Kept as a separate page from /privacy because Meta's reviewers look for
+        a page whose entire subject is deletion, not a section inside a longer
+        policy.
+        """
+        return _page("Data Deletion Instructions", f"""
+<h1>How to delete your data</h1>
+<p class=sub>Last updated {updated}</p>
+
+<p>This service sends quote follow-up messages on behalf of a trade contractor.
+If you have received a message from it, or your details were included in a
+quote processed by it, you can have that data removed.</p>
+
+<h2>Fastest: reply STOP</h2>
+<p>Reply <strong>STOP</strong> to any message you have received. This stops all
+further messages to you immediately and marks your record for deletion. You do
+not need to explain why, and nobody will contact you to ask.</p>
+
+<h2>By email</h2>
+<p>Write to {contact} with the phone number or email address that received the
+message. Deletion is completed within 30 days, and normally within a few
+working days.</p>
+
+<h2>What gets deleted</h2>
+<ul>
+  <li>Your name, phone number and email address.</li>
+  <li>The quote details associated with you.</li>
+  <li>The message history between you and this service.</li>
+</ul>
+
+<h2>What may remain</h2>
+<p>Messages already delivered over WhatsApp remain in Meta's systems and in the
+recipients' own devices and chat history; that is outside this service's
+control. The contractor also keeps their own copy of the quote, which is their
+business record and is not ours to delete — contact them directly about it.</p>
+
+<h2>Contact</h2>
+<p>{contact}</p>
+<footer>See also the <a href="/privacy">Privacy Policy</a>.</footer>""")
+
     @router.get("/terms", response_class=HTMLResponse)
     async def terms() -> str:
         return _page("Terms of Service", f"""

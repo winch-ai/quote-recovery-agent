@@ -164,3 +164,30 @@ class TestLegalPages:
         resp = TestClient(app).get("/privacy")
         assert resp.status_code == 200
         assert "mailto:" not in resp.text
+
+
+class TestDataDeletionPage:
+    """Meta requires a Data Deletion Instructions URL before an app goes Live."""
+
+    def _client(self, email="ops@example.com"):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from winch.legal import build_router
+        app = FastAPI()
+        app.include_router(build_router(email, "Example Ltd"))
+        return TestClient(app)
+
+    def test_page_is_publicly_reachable(self):
+        assert self._client().get("/data-deletion").status_code == 200
+
+    def test_stop_is_offered_as_the_fastest_route(self):
+        """A route that needs no email and no explanation is the one people use."""
+        assert "STOP" in self._client().get("/data-deletion").text
+
+    def test_it_is_honest_about_what_cannot_be_deleted(self):
+        """Claiming to delete messages already on someone's phone would be false."""
+        body = self._client().get("/data-deletion").text
+        assert "Meta's systems" in body
+
+    def test_it_states_a_deletion_deadline(self):
+        assert "30 days" in self._client().get("/data-deletion").text
