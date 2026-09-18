@@ -188,3 +188,89 @@ class PostgresEventSink:
                     """,
                     (quote_id, event_type_str, payload_param, at_param),
                 )
+
+
+class PostgresThreadIndex:
+    """Postgres-backed index mapping WhatsApp contacts and interrupts to threads."""
+
+    def __init__(self, pool: AsyncConnectionPool) -> None:
+        self._pool = pool
+
+    async def bind_customer(self, quote_id: str, customer_wa_id: str) -> None:
+        """Record which number is the customer on this quote. Idempotent."""
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO quote_threads (quote_id, customer_wa_id, updated_at)
+                    VALUES (%s, %s, now())
+                    ON CONFLICT (quote_id) DO UPDATE
+                    SET customer_wa_id = EXCLUDED.customer_wa_id,
+                        updated_at = now();
+                    """,
+                    (quote_id, customer_wa_id),
+                )
+
+    async def mark_awaiting(self, quote_id: str, awaiting: bool) -> None:
+        """Flag/unflag this quote as waiting on a contractor answer."""
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO quote_threads (quote_id, awaiting, updated_at)
+                    VALUES (%s, %s, now())
+                    ON CONFLICT (quote_id) DO UPDATE
+                    SET awaiting = EXCLUDED.awaiting,
+                        updated_at = now();
+                    """,
+                    (quote_id, awaiting),
+                )
+
+    async def close(self, quote_id: str) -> None:
+        """Mark the thread closed so it stops matching lookups."""
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO quote_threads (quote_id, closed, updated_at)
+                    VALUES (%s, true, now())
+                    ON CONFLICT (quote_id) DO UPDATE
+                    SET closed = true,
+                        updated_at = now();
+                    """,
+                    (quote_id,),
+                )
+
+    async def thread_for_customer(self, customer_wa_id: str) -> str | None:
+        """Most recent non-closed quote for that customer number, else None."""
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT quote_id
+                    FROM quote_threads
+                    WHERE customer_wa_id = %s AND closed = false
+                    ORDER BY updated_at DESC
+                    LIMIT 1;
+                    """,
+                    (customer_wa_id,),
+                )
+                row = await cur.fetchone()
+                return row[0] if row is not None else None
+
+    async def pending_thread(self) -> str | None:
+        """Most recently flagged awaiting, non-closed thread, else None."""
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT quote_id
+                    FROM quote_threads
+                    WHERE awaiting = true AND closed = false
+                    ORDER BY updated_at DESC
+                    LIMIT 1;
+                    """
+                )
+                row = await cur.fetchone()
+                return row[0] if row is not None else None
+
