@@ -1142,3 +1142,55 @@ class TestCrashedIntakeDoesNotPoisonFutureMessages:
         assert "nothing outstanding" in sent[0].lower(), (
             f"expected the nothing-pending acknowledgment, got: {sent[0]!r}"
         )
+
+
+class TestCombinedLLMSatisfiesTheProtocol:
+    """The exact bug that hit production: classify_contractor_reply was added
+    to the LLMClient protocol, to AzureTextClient, and to every test fake -
+    but never to _CombinedLLM, the wrapper Runtime.start() actually builds and
+    wires into the graph. Every await_confirm/await_gate call in production
+    hit AttributeError, because nothing in the test suite ever exercised
+    _CombinedLLM itself - only FakeLLM, which was kept in sync by hand.
+
+    LLMClient is @runtime_checkable specifically so this class of drift can
+    be caught structurally, without needing to remember to update every call
+    site by hand whenever the protocol grows a method.
+    """
+
+    def _combined(self):
+        from winch.app import _CombinedLLM
+
+        class FakeExtractor:
+            async def extract_quote(self, media, mime_type):
+                return "draft"
+
+        class FakeText:
+            async def classify_intent(self, text):
+                return "intent"
+
+            async def classify_contractor_reply(self, text):
+                return "contractor_intent"
+
+            async def compose_reply(self, quote, customer_message):
+                return "reply"
+
+        return _CombinedLLM(FakeExtractor(), FakeText())
+
+    def test_combined_llm_structurally_satisfies_llmclient(self):
+        from winch.protocols import LLMClient
+
+        assert isinstance(self._combined(), LLMClient), (
+            "_CombinedLLM is missing a method LLMClient declares - this is "
+            "exactly the gap that let classify_contractor_reply go missing "
+            "and crash every confirm/gate reply in production"
+        )
+
+    async def test_classify_contractor_reply_actually_delegates(self):
+        combined = self._combined()
+        assert await combined.classify_contractor_reply("check in now") == "contractor_intent"
+
+    async def test_every_other_method_still_delegates(self):
+        combined = self._combined()
+        assert await combined.extract_quote(b"x", "application/pdf") == "draft"
+        assert await combined.classify_intent("x") == "intent"
+        assert await combined.compose_reply(None, "x") == "reply"

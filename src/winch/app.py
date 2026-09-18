@@ -190,6 +190,9 @@ class _CombinedLLM:
     async def classify_intent(self, text: str):
         return await self._text.classify_intent(text)
 
+    async def classify_contractor_reply(self, text: str):
+        return await self._text.classify_contractor_reply(text)
+
     async def compose_reply(self, quote, customer_message: str) -> str:
         return await self._text.compose_reply(quote, customer_message)
 
