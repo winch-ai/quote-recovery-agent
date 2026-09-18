@@ -321,3 +321,95 @@ class TestAppBoots:
         paths = set(create_app().openapi()["paths"])
         assert {"/webhook/meta", "/internal/tick", "/internal/events",
                 "/health", "/privacy", "/terms", "/data-deletion"} <= paths
+
+
+class TestInterruptNotification:
+    """The bug that stopped every real message reaching the contractor.
+
+    interrupt() correctly pauses the graph and returns a payload in
+    result["__interrupt__"], but nothing in _handle ever read that value and
+    sent it anywhere. Four real quotes parsed successfully end-to-end and the
+    contractor received nothing, because the graph was genuinely waiting at
+    collect_contact - there was just no message telling them so.
+    """
+
+    def test_collect_contact_payload_asks_for_missing_fields(self):
+        from winch.app import _render_interrupt
+
+        text = _render_interrupt({
+            "kind": "collect_contact",
+            "missing": ["customer_phone"],
+            "draft": {"project_title": "2km stock fencing"},
+        })
+        assert "2km stock fencing" in text
+        assert "customer_phone" in text
+
+    def test_collect_contact_with_nothing_missing_still_prompts_a_reply(self):
+        from winch.app import _render_interrupt
+
+        text = _render_interrupt({
+            "kind": "collect_contact", "missing": [],
+            "draft": {"project_title": "Fencing"},
+        })
+        assert "Reply anything to continue" in text
+
+    def test_confirm_quote_shows_the_frozen_total_and_asks_to_activate(self):
+        from winch.app import _render_interrupt
+
+        text = _render_interrupt({
+            "kind": "confirm_quote",
+            "draft": {"quote_total": 24504.0, "currency": "GBP",
+                     "customer_name": "Mark Henderson", "customer_phone": "07700900412",
+                     "project_title": "2km stock fencing"},
+            "cadence_days": [2, 5, 9],
+        })
+        assert "24,504.00" in text
+        assert "Mark Henderson" in text
+        assert "YES" in text
+
+    def test_approve_send_shows_the_preview(self):
+        from winch.app import _render_interrupt
+
+        text = _render_interrupt({
+            "kind": "approve_send", "template": "checkin_soft",
+            "preview": "[checkin_soft] Mark | Dave | ...",
+        })
+        assert "checkin_soft" in text
+        assert "HOLD" in text
+
+    def test_unknown_kind_does_not_crash(self):
+        from winch.app import _render_interrupt
+
+        assert "mystery" in _render_interrupt({"kind": "mystery"})
+
+    async def test_notify_sends_when_the_result_has_an_interrupt(self):
+        from winch.app import _notify_contractor_of_interrupt
+
+        class FakeInterrupt:
+            value = {"kind": "collect_contact", "missing": [], "draft": {}}
+
+        sent = []
+
+        class FakeChannel:
+            async def send_freeform(self, to, body):
+                sent.append((to, body))
+
+        await _notify_contractor_of_interrupt(
+            None, FakeChannel(), "44770", {"__interrupt__": [FakeInterrupt()]}
+        )
+        assert len(sent) == 1
+        assert sent[0][0] == "44770"
+
+    async def test_notify_sends_nothing_when_the_graph_ran_to_completion(self):
+        """A result with no __interrupt__ key means the graph finished or ended
+        - nothing to tell the contractor, and definitely not a spurious message."""
+        from winch.app import _notify_contractor_of_interrupt
+
+        sent = []
+
+        class FakeChannel:
+            async def send_freeform(self, to, body):
+                sent.append((to, body))
+
+        await _notify_contractor_of_interrupt(None, FakeChannel(), "44770", {"status": "CLOSED"})
+        assert sent == []

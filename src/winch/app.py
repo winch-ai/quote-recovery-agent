@@ -67,6 +67,7 @@ class Runtime:
         self.pool = None
         self.cp_pool = None
         self.graph = None
+        self.contractor_channel = None
         self.deduplicator = None
         self.queue = None
         self.events = None
@@ -93,6 +94,7 @@ class Runtime:
         text = AzureTextClient(s.azure_endpoint, s.azure_api_key,
                                s.azure_deployment, s.azure_api_version)
 
+        self.contractor_channel = channel
         deps = Deps(
             llm=_CombinedLLM(extractor, text),
             channel=channel,
@@ -240,11 +242,13 @@ async def _handle(runtime: Runtime, settings: Settings, event: ParsedEvent) -> N
         logger.info("intake: quote=%s media=%s mime=%s", quote_id,
                     event.media_id, event.media_mime)
         await runtime.threads.mark_awaiting(quote_id, True)
-        await runtime.graph.ainvoke(
+        result = await runtime.graph.ainvoke(
             {"quote_id": quote_id, "media_id": event.media_id,
              "status": QuoteStatus.DRAFT, "_entry": Entry.INTAKE},
             {"configurable": {"thread_id": quote_id}},
         )
+        await _notify_contractor_of_interrupt(
+            runtime, runtime.contractor_channel, settings.contractor_wa_id, result)
         logger.info("intake complete: quote=%s", quote_id)
         return
 
@@ -255,10 +259,12 @@ async def _handle(runtime: Runtime, settings: Settings, event: ParsedEvent) -> N
         if thread is None:
             logger.info("contractor message with no pending interrupt; ignoring")
             return
-        await runtime.graph.ainvoke(
+        result = await runtime.graph.ainvoke(
             Command(resume=_parse_contractor_reply(event)),
             {"configurable": {"thread_id": thread}},
         )
+        await _notify_contractor_of_interrupt(
+            runtime, runtime.contractor_channel, settings.contractor_wa_id, result)
         await _sync_thread_index(runtime, thread)
         return
 
@@ -272,10 +278,72 @@ async def _handle(runtime: Runtime, settings: Settings, event: ParsedEvent) -> N
         text=event.text or event.button_payload or "",
         received_at=event.timestamp,
     )
-    await runtime.graph.ainvoke(
+    result = await runtime.graph.ainvoke(
         {"_entry": Entry.INBOUND, "inbound": [inbound]},
         {"configurable": {"thread_id": thread}},
     )
+    await _notify_contractor_of_interrupt(
+        runtime, runtime.contractor_channel, settings.contractor_wa_id, result)
+
+
+def _render_interrupt(payload: dict) -> str:
+    """Turn an interrupt() payload into contractor-facing text.
+
+    graph.py / nodes.py already build the right payload shape at each gate;
+    this is the one place that was missing entirely - _handle discarded every
+    ainvoke() result, so a paused graph never told the contractor it was
+    waiting on them. From their side that looked identical to nothing having
+    happened at all.
+    """
+    kind = payload.get("kind")
+
+    if kind == "collect_contact":
+        draft = payload.get("draft") or {}
+        missing = payload.get("missing") or []
+        lines = [f"Got it - {draft.get('project_title', 'the quote')}."]
+        if missing:
+            lines.append("Missing: " + ", ".join(missing) + ". Reply with them.")
+        else:
+            lines.append("Reply anything to continue.")
+        return "\n".join(lines)
+
+    if kind == "confirm_quote":
+        draft = payload.get("draft") or {}
+        total = draft.get("quote_total") or 0.0
+        currency = draft.get("currency") or ""
+        cadence = payload.get("cadence_days") or []
+        cadence_str = "/".join(str(d) for d in cadence)
+        lines = [
+            f"Parsed quote: {currency} {total:,.2f}",
+            f"Client: {draft.get('customer_name')} ({draft.get('customer_phone') or 'no phone'}).",
+            f"Project: {draft.get('project_title')}",
+            f"Sequence: day {cadence_str} check-ins.",
+            "",
+            "Reply YES to activate follow-ups, or send corrections.",
+        ]
+        return "\n".join(lines)
+
+    if kind == "approve_send":
+        lines = [
+            f"Sending [{payload.get('template')}] next:",
+            f"{payload.get('preview')}",
+            "",
+            "Reply YES to send, or HOLD to skip this one.",
+        ]
+        return "\n".join(lines)
+
+    return f"Waiting on you: {kind}"
+
+
+async def _notify_contractor_of_interrupt(runtime: Runtime, deps_channel, wa_id: str,
+                                          result: dict) -> None:
+    """If the invocation paused at interrupt(), tell the contractor. Every
+    graph.ainvoke() call site must route its result through this."""
+    interrupts = result.get("__interrupt__")
+    if not interrupts:
+        return
+    text = _render_interrupt(interrupts[0].value)
+    await deps_channel.send_freeform(wa_id, text)
 
 
 async def _sync_thread_index(runtime: Runtime, thread: str) -> None:
@@ -387,10 +455,12 @@ def _internal_router(runtime: Runtime, settings: Settings) -> APIRouter:
         claimed = await runtime.queue.claim_due(now)
         for due in claimed:
             try:
-                await runtime.graph.ainvoke(
+                result = await runtime.graph.ainvoke(
                     {"_entry": Entry.TICK, "pending_gate_index": due.touchpoint_index},
                     {"configurable": {"thread_id": due.quote_id}},
                 )
+                await _notify_contractor_of_interrupt(
+                    runtime, runtime.contractor_channel, settings.contractor_wa_id, result)
             except Exception:
                 logger.exception("tick failed for %s/%s", due.quote_id,
                                  due.touchpoint_index)
