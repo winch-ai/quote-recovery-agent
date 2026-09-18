@@ -113,6 +113,22 @@ class LLMClient(Protocol):
         """
         ...
 
+    async def wants_immediate_action(self, text: str) -> bool:
+        """Does this approval also carry urgency - "now", "today", "straight
+        away" - as opposed to being content with the standard cadence?
+
+        A second, independent judgment from classify_contractor_reply, not a
+        keyword check: "check in now" and "follow up now actually" both read
+        as plain approval on the decision axis, but ALSO signal urgency on
+        this axis, and the two must not be conflated into one guess. The
+        caller's job on True is to ask a clarifying question - send today, or
+        the normal schedule - never to pick a meaning silently.
+
+        MUST NOT raise. False on any failure: the safe default is the
+        standard cadence, never an unrequested urgent path.
+        """
+        ...
+
     async def compose_reply(self, quote: Quote, customer_message: str) -> str:
         """Draft a free-form reply. Only legal inside an open 24-hour window.
 

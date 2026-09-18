@@ -54,11 +54,18 @@ class FakeLLM:
         low = (text or "").strip().lower()
         tokens = set(re.findall(r"[a-z']+", low))
         approve_phrases = ("check in now", "go on then", "go for it", "sounds good")
-        if any(p in low for p in approve_phrases) or tokens & {"yes", "yep", "approve", "ok", "start", "send"}:
+        if any(p in low for p in approve_phrases) or tokens & {"yes", "yep", "approve", "ok", "start", "send", "follow"}:
             return ContractorReplyIntent.APPROVED
         if tokens & {"no", "cancel", "hold", "stop"}:
             return ContractorReplyIntent.DECLINED
         return ContractorReplyIntent.UNCLEAR
+
+    async def wants_immediate_action(self, text):
+        """Deterministic stand-in matching the CONTRACT, not exact judgment -
+        true understanding is tested against real Azure elsewhere."""
+        low = (text or "").strip().lower()
+        return any(w in low for w in ("now", "today", "immediately", "right away",
+                                      "straight away", "asap"))
 
     async def compose_reply(self, quote, customer_message):
         return "ok"
@@ -239,13 +246,21 @@ class TestContractorReplyIsUnderstoodNotKeywordMatched:
 
     async def test_the_exact_reported_phrase_is_understood_as_approval(self):
         """This is the literal reproduction: it must APPROVE, not merely
-        survive without closing. Genuine understanding, not damage control."""
+        survive without closing. Genuine understanding, not damage control.
+
+        "check in now" also carries urgency ("now"), so it correctly pauses
+        at the timing clarification rather than jumping straight to
+        scheduled - that pause IS the approval being understood; answering
+        it completes the flow.
+        """
         deps, graph = make()
         state = {"quote_id": "qreal1", "media_id": "m1", "status": QuoteStatus.DRAFT,
                  "_entry": Entry.INTAKE}
         await graph.ainvoke(state, cfg("treal1"))
-        final = await graph.ainvoke(Command(resume={"text": "check in now"}), cfg("treal1"))
+        mid = await graph.ainvoke(Command(resume={"text": "check in now"}), cfg("treal1"))
+        assert mid["__interrupt__"][0].value["kind"] == "confirm_timing"
 
+        final = await graph.ainvoke(Command(resume={"text": "yes, today"}), cfg("treal1"))
         assert final["status"] is QuoteStatus.ACTIVE, (
             "\"check in now\" is a clear approval and must be understood as one"
         )
@@ -332,6 +347,124 @@ class TestContractorReplyIsUnderstoodNotKeywordMatched:
         assert len(deps.channel.templates) == 1
 
 
+class TestSuccessfulOutcomesAreConfirmedNotSilent:
+    """Reported directly, three times in a row: 'check in now', 'send now'
+    and 'follow up now actually' were all correctly understood as approval,
+    correctly scheduled server-side (approval_received fired every time),
+    and produced ZERO message back to the contractor. Having just approved
+    something, silence is indistinguishable from the reply not registering
+    at all - the same failure class already fixed for error paths, now fixed
+    for the success paths that were still silent.
+    """
+
+    async def test_approving_a_quote_confirms_the_schedule(self):
+        deps, graph = make()
+        state = {"quote_id": "qconf1", "media_id": "m1", "status": QuoteStatus.DRAFT,
+                 "_entry": Entry.INTAKE}
+        await graph.ainvoke(state, cfg("tconf1"))
+        await graph.ainvoke(Command(resume={"text": "yes"}), cfg("tconf1"))
+
+        assert deps.channel.freeforms, "an approval must be confirmed, not silent"
+        assert "day 2" in deps.channel.freeforms[-1][1]
+
+    async def test_an_urgent_approval_asks_about_timing_then_confirms_today(self):
+        """The exact reported case: 'follow up now actually' carries urgency,
+        so it must pause and ask rather than silently picking a meaning -
+        and once answered, it must actually schedule for today, and confirm
+        that, not the normal-schedule wording."""
+        deps, graph = make()
+        state = {"quote_id": "qconf1b", "media_id": "m1", "status": QuoteStatus.DRAFT,
+                 "_entry": Entry.INTAKE}
+        await graph.ainvoke(state, cfg("tconf1b"))
+        mid = await graph.ainvoke(
+            Command(resume={"text": "follow up now actually"}), cfg("tconf1b")
+        )
+        assert mid["__interrupt__"][0].value["kind"] == "confirm_timing"
+        assert deps.channel.freeforms == [], "must ask before assuming either timing"
+
+        final = await graph.ainvoke(Command(resume={"text": "yes today"}), cfg("tconf1b"))
+
+        assert final["status"] is QuoteStatus.ACTIVE
+        assert deps.channel.freeforms, "must confirm once resolved"
+        assert "today" in deps.channel.freeforms[-1][1].lower()
+        touchpoints = deps.queue.scheduled[0][1]
+        assert touchpoints[0].due_at <= touchpoints[1].due_at
+
+    async def test_the_immediate_flag_actually_changes_the_cadence_passed_to_the_scheduler(self, monkeypatch):
+        """Decisive version of the test above: asserts on the cadence_days
+        nodes.schedule() actually requests, rather than on real-clock due
+        dates - which near a weekend round the 0-day and +2-day offsets to
+        the SAME business slot, making a due-date comparison pass even if
+        the _immediate flag were silently ignored. That exact mutation
+        (schedule() dropping the flag) slipped past the due-date version of
+        this test; this one catches it directly.
+        """
+        import winch.nodes as nodes_module
+        captured = {}
+        real_build_sequence = nodes_module.build_sequence
+
+        def spy(approved_at, timezone_name, **kwargs):
+            captured["cadence_days"] = kwargs.get("cadence_days")
+            return real_build_sequence(approved_at, timezone_name, **kwargs)
+
+        monkeypatch.setattr(nodes_module, "build_sequence", spy)
+
+        deps, graph = make()
+        state = {"quote_id": "qcad1", "media_id": "m1", "status": QuoteStatus.DRAFT,
+                 "_entry": Entry.INTAKE}
+        await graph.ainvoke(state, cfg("tcad1"))
+        await graph.ainvoke(Command(resume={"text": "check in now"}), cfg("tcad1"))
+        await graph.ainvoke(Command(resume={"text": "yes today"}), cfg("tcad1"))
+
+        assert captured["cadence_days"] == (0, 5, 9), (
+            f"expected the immediate cadence, got {captured['cadence_days']!r}"
+        )
+
+    async def test_urgency_detected_but_contractor_prefers_normal_schedule(self):
+        """Saying no to the timing question means the NORMAL schedule, not
+        cancelling the quote - a different meaning of 'no' than at the
+        top-level approval question, and the two must not be conflated."""
+        deps, graph = make()
+        state = {"quote_id": "qconf1c", "media_id": "m1", "status": QuoteStatus.DRAFT,
+                 "_entry": Entry.INTAKE}
+        await graph.ainvoke(state, cfg("tconf1c"))
+        await graph.ainvoke(Command(resume={"text": "check in now"}), cfg("tconf1c"))
+        final = await graph.ainvoke(Command(resume={"text": "no, normal is fine"}), cfg("tconf1c"))
+
+        assert final["status"] is QuoteStatus.ACTIVE, (
+            "declining the TIMING question must not cancel the quote"
+        )
+        assert "day 2" in deps.channel.freeforms[-1][1]
+
+    async def test_a_successful_send_confirms_it_went_out(self):
+        deps, graph = make()
+        state = {"quote_id": "qconf2", "media_id": "m1", "status": QuoteStatus.DRAFT,
+                 "_entry": Entry.INTAKE}
+        await graph.ainvoke(state, cfg("tconf2"))
+        await graph.ainvoke(Command(resume={"text": "yes"}), cfg("tconf2"))
+        await graph.ainvoke({"_entry": Entry.TICK, "pending_gate_index": 0}, cfg("tconf2"))
+        deps.channel.freeforms.clear()  # discard the schedule confirmation above
+
+        await graph.ainvoke(Command(resume={"text": "send now"}), cfg("tconf2"))
+
+        assert deps.channel.freeforms, "a successful send must be confirmed, not silent"
+        assert "sent" in deps.channel.freeforms[-1][1].lower()
+
+    async def test_holding_a_touchpoint_confirms_the_hold(self):
+        deps, graph = make()
+        state = {"quote_id": "qconf3", "media_id": "m1", "status": QuoteStatus.DRAFT,
+                 "_entry": Entry.INTAKE}
+        await graph.ainvoke(state, cfg("tconf3"))
+        await graph.ainvoke(Command(resume={"text": "yes"}), cfg("tconf3"))
+        await graph.ainvoke({"_entry": Entry.TICK, "pending_gate_index": 0}, cfg("tconf3"))
+        deps.channel.freeforms.clear()
+
+        await graph.ainvoke(Command(resume={"text": "no, hold that one"}), cfg("tconf3"))
+
+        assert deps.channel.freeforms, "a hold must be confirmed, not silent"
+        assert "held" in deps.channel.freeforms[-1][1].lower()
+
+
 class TestIntakeFlow:
     async def test_a_complete_draft_skips_straight_to_confirm(self):
         """A quote with nothing missing must not pause at collect_contact at
@@ -373,10 +506,11 @@ class TestIntakeFlow:
         await graph.ainvoke(state, cfg("t2"))
         final = await graph.ainvoke(Command(resume={"text": "no"}), cfg("t2"))
         assert final["status"] is QuoteStatus.CLOSED
-        assert deps.channel.freeforms == [], (
-            "an unsubscribe must not ping the contractor like a normal reply"
-        )
         assert deps.queue.scheduled == []
+        # A decline is a terminal outcome the contractor must be told about -
+        # silence here is indistinguishable from the reply not registering.
+        assert deps.channel.freeforms, "declining a quote must be confirmed, not silent"
+        assert "closed" in deps.channel.freeforms[-1][1].lower()
 
     async def test_extraction_failure_alerts_instead_of_dying_quietly(self):
         deps, graph = make(llm=FakeLLM(fail=True))

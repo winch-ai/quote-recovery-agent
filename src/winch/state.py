@@ -165,3 +165,4 @@ class GraphState(TypedDict, total=False):
     _variables: list[str]
     _decision: dict
     _missing: list[str]
+    _immediate: bool

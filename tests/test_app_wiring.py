@@ -1194,3 +1194,19 @@ class TestCombinedLLMSatisfiesTheProtocol:
         assert await combined.extract_quote(b"x", "application/pdf") == "draft"
         assert await combined.classify_intent("x") == "intent"
         assert await combined.compose_reply(None, "x") == "reply"
+
+
+class TestTimingClarificationRendering:
+    """The two new interrupt kinds added for the immediacy-detection fix."""
+
+    def test_confirm_timing_offers_today_or_normal(self):
+        from winch.app import _render_interrupt
+        text = _render_interrupt({"kind": "confirm_timing"})
+        assert "today" in text.lower()
+        assert "YES" in text and "NO" in text
+
+    def test_confirm_timing_unclear_repeats_the_question(self):
+        from winch.app import _render_interrupt
+        text = _render_interrupt({"kind": "confirm_timing_unclear", "heard": "maybe"})
+        assert "maybe" in text
+        assert "today" in text.lower()

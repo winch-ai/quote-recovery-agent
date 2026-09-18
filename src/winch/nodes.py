@@ -138,6 +138,31 @@ async def confirm(state: GraphState, deps: Deps) -> dict:
     return {}
 
 
+async def _clarify_timing(deps: Deps) -> bool:
+    """Ask whether the first check-in should go out today or on the normal
+    schedule, after a reply approved AND signalled urgency. Returns True for
+    today, False for the normal cadence.
+
+    Reuses classify_contractor_reply for the answer itself - APPROVED means
+    "yes, today", DECLINED means "no, the normal schedule is fine" (a
+    different meaning from DECLINED at the top-level approval question,
+    which is exactly why this stays a separate resolution loop rather than
+    folding into that branch). UNCLEAR re-asks rather than guessing.
+    """
+    payload = {"kind": "confirm_timing"}
+    while True:
+        decision = interrupt(payload)
+        reply_text = (decision or {}).get("text", "")
+        intent = await deps.llm.classify_contractor_reply(reply_text)
+
+        if intent is ContractorReplyIntent.APPROVED:
+            return True
+        if intent is ContractorReplyIntent.DECLINED:
+            return False
+
+        payload = {"kind": "confirm_timing_unclear", "heard": reply_text}
+
+
 async def await_confirm(state: GraphState, deps: Deps) -> dict:
     """Interrupt, classifying the reply with an LLM rather than keyword
     matching, and re-asking when it is genuinely unclear.
@@ -186,11 +211,54 @@ async def await_confirm(state: GraphState, deps: Deps) -> dict:
                 currency=draft.currency or "GBP",
                 expiry_date=draft.expiry_date,
             ))
-            return {"quote": quote, "status": QuoteStatus.ACTIVE, "_decision": {}}
+
+            # A second, independent judgment from the approve/decline
+            # decision above: does this reply ALSO carry urgency ("now",
+            # "today"), or is it content with the standard cadence? Not a
+            # keyword check - a genuine second classification, because
+            # conflating "yes" with "yes, right now" into one guess is
+            # exactly the mistake this whole flow exists to avoid. On True,
+            # ask rather than silently picking a meaning.
+            immediate = False
+            if await deps.llm.wants_immediate_action(reply_text):
+                # Only two sane outcomes to this sub-question: today, or the
+                # normal cadence. DECLINED here means "no, normal schedule is
+                # fine" - a different meaning from DECLINED at the top-level
+                # approval, which is why this is its own small resolution
+                # loop rather than reusing that branch's semantics.
+                immediate = await _clarify_timing(deps)
+
+            # This is the graph's terminal step for a successful approval -
+            # confirm/await_confirm -> schedule -> END, with no further
+            # interrupt. Without an explicit confirmation here the contractor
+            # gets zero feedback that their approval did anything: found in
+            # production, three separate approvals ("check in now", "send
+            # now", "follow up now actually") were all correctly understood
+            # and correctly scheduled, and every one produced total silence.
+            try:
+                when = "today" if immediate else "on day 2"
+                await deps.contractor_channel.send_freeform(
+                    deps.contractor.wa_id,
+                    f"Done - I'll check in with {quote.customer_name} {when}, "
+                    f"then day 5 and day 9. I'll ask you before each one goes out.",
+                )
+            except Exception:
+                logger.exception("failed to confirm schedule start for %s",
+                                 state["quote_id"])
+            return {"quote": quote, "status": QuoteStatus.ACTIVE, "_decision": {},
+                    "_immediate": immediate}
 
         if intent is ContractorReplyIntent.DECLINED:
             await deps.events.write(state["quote_id"], EventType.QUOTE_CLOSED,
                                     {"reason": "not_approved"})
+            try:
+                await deps.contractor_channel.send_freeform(
+                    deps.contractor.wa_id,
+                    f"No problem - closed {draft.customer_name or 'that'} quote. "
+                    f"Forward it again whenever you want to pick it back up.",
+                )
+            except Exception:
+                logger.exception("failed to confirm decline for %s", state["quote_id"])
             return {"status": QuoteStatus.CLOSED, "_decision": {}}
 
         # UNCLEAR - re-ask rather than guessing on the contractor's behalf.
@@ -221,8 +289,17 @@ async def apply_edits(state: GraphState, deps: Deps) -> dict:
 
 
 async def schedule(state: GraphState, deps: Deps) -> dict:
-    """Write the durable plan. Timing is arithmetic, never a model decision."""
-    touchpoints = build_sequence(datetime.now(timezone.utc), deps.contractor.timezone)
+    """Write the durable plan. Timing is arithmetic, never a model decision.
+
+    When await_confirm resolved the reply as wanting immediate action, the
+    first touchpoint's offset is 0 days instead of the standard 2 - still
+    shifted into the next business window by next_business_window, so
+    "immediate" never means texting a customer outside working hours. The
+    remaining cadence (day 5, day 9) is unchanged either way.
+    """
+    cadence = (0, 5, 9) if state.get("_immediate") else None
+    kwargs = {"cadence_days": cadence} if cadence else {}
+    touchpoints = build_sequence(datetime.now(timezone.utc), deps.contractor.timezone, **kwargs)
     await deps.queue.schedule(state["quote_id"], touchpoints)
     return {"touchpoints": touchpoints, "status": QuoteStatus.ACTIVE}
 
@@ -292,6 +369,15 @@ async def await_gate(state: GraphState, deps: Deps) -> dict:
             updated = list(state["touchpoints"])
             updated[index] = tp.model_copy(update={"status": TouchpointStatus.HELD})
             await deps.queue.mark(state["quote_id"], index, TouchpointStatus.HELD)
+            try:
+                await deps.contractor_channel.send_freeform(
+                    deps.contractor.wa_id,
+                    f"Held - won't send {tp.template_name}. Nothing else scheduled "
+                    f"is affected.",
+                )
+            except Exception:
+                logger.exception("failed to confirm hold for %s/%s",
+                                 state["quote_id"], index)
             return {"touchpoints": updated}
 
         # UNCLEAR - re-ask rather than silently holding.
@@ -357,6 +443,18 @@ async def send(state: GraphState, deps: Deps) -> dict:
         "provider_message_id": result.provider_message_id,
     })
     await deps.queue.mark(state["quote_id"], index, TouchpointStatus.SENT)
+    # Same silence gap as the failure branch above, mirrored for success: the
+    # contractor approved a send and deserves to know it actually went out,
+    # not just find out later (or never) whether it did.
+    try:
+        await deps.contractor_channel.send_freeform(
+            deps.contractor.wa_id,
+            f"Sent - {tp.template_name} is on its way to "
+            f"{quote.customer_name if quote else 'the customer'}.",
+        )
+    except Exception:
+        logger.exception("failed to confirm successful send for %s/%s",
+                         state["quote_id"], index)
     return {"touchpoints": updated, "channel": ChannelState.WHATSAPP}
 
 

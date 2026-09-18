@@ -230,6 +230,18 @@ Prefer UNCLEAR over a wrong guess. Silently guessing wrong here is worse than
 asking again, because the wrong guess either sends something to a customer
 without real approval, or cancels a quote the contractor never meant to kill."""
 
+URGENCY_CLASSIFIER_SYSTEM_PROMPT = """A contractor just approved a WhatsApp follow-up plan for a trade quote, which
+normally checks in with the customer over the coming days (day 2, day 5,
+day 9). Decide if their reply ALSO asks for the first check-in to happen
+immediately, rather than being content with that normal timing.
+
+Return true when the reply signals urgency or immediacy - e.g. "now",
+"today", "right away", "straight away", "as soon as possible", "don't wait".
+Return false for plain approval with no urgency signal - e.g. "yes", "go
+ahead", "sounds good", "sure", "yep", or anything not clearly urgent.
+
+This is independent of whether they approved at all - only judge urgency."""
+
 COMPOSE_REPLY_SYSTEM_PROMPT = (
     "You draft a short, plain reply to a customer in the contractor's voice.\n\n"
     "Rules:\n"
@@ -276,6 +288,22 @@ def _build_contractor_reply_response_format() -> dict[str, Any]:
                     },
                 },
                 "required": ["intent"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def _build_urgency_response_format() -> dict[str, Any]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "urgency_classification",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {"urgent": {"type": "boolean"}},
+                "required": ["urgent"],
                 "additionalProperties": False,
             },
         },
@@ -432,6 +460,39 @@ class AzureTextClient:
             return ContractorReplyIntent(intent_val)
         except Exception:
             return ContractorReplyIntent.UNCLEAR
+
+    async def wants_immediate_action(self, text: str) -> bool:
+        """Mirrors classify_contractor_reply's defensive shape. False (the
+        safe default: standard cadence) on any failure - never raises."""
+        try:
+            url = self._build_url()
+            headers = {
+                "Content-Type": "application/json",
+                "api-key": self.api_key,
+            }
+            body = {
+                "messages": [
+                    {"role": "system", "content": URGENCY_CLASSIFIER_SYSTEM_PROMPT},
+                    {"role": "user", "content": text},
+                ],
+                "response_format": _build_urgency_response_format(),
+                "max_completion_tokens": 20,
+            }
+
+            if self.http_client is not None:
+                response = await self._send_with_retries(self.http_client, url, headers, body)
+            else:
+                async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+                    response = await self._send_with_retries(client, url, headers, body)
+
+            data = response.json()
+            raw_content = data["choices"][0]["message"]["content"]
+            if raw_content is None:
+                return False
+            parsed = json.loads(raw_content)
+            return bool(parsed.get("urgent", False))
+        except Exception:
+            return False
 
     async def compose_reply(self, quote: Quote, customer_message: str) -> str:
         url = self._build_url()

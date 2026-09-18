@@ -193,6 +193,9 @@ class _CombinedLLM:
     async def classify_contractor_reply(self, text: str):
         return await self._text.classify_contractor_reply(text)
 
+    async def wants_immediate_action(self, text: str) -> bool:
+        return await self._text.wants_immediate_action(text)
+
     async def compose_reply(self, quote, customer_message: str) -> str:
         return await self._text.compose_reply(quote, customer_message)
 
@@ -440,6 +443,26 @@ def _render_interrupt(payload: dict) -> str:
             f"Didn't catch that for the {payload.get('template')} message"
             + (f' (I saw: "{heard}").' if heard else "."),
             "Reply YES to send it, or HOLD to skip this one for now.",
+            SWIPE_HINT,
+        ]
+        return "\n".join(lines)
+
+    if kind == "confirm_timing":
+        lines = [
+            "Want me to send the first check-in today instead of waiting "
+            "the usual couple of days?",
+            "Reply YES for today, or NO to stick with the normal schedule.",
+            SWIPE_HINT,
+        ]
+        return "\n".join(lines)
+
+    if kind == "confirm_timing_unclear":
+        heard = payload.get("heard") or ""
+        lines = [
+            "Sorry, didn't catch that"
+            + (f' (I saw: "{heard}").' if heard else "."),
+            "Reply YES to send the first check-in today, or NO for the "
+            "normal schedule.",
             SWIPE_HINT,
         ]
         return "\n".join(lines)
