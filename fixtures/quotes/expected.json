@@ -1,0 +1,43 @@
+{
+  "uk_fencing.pdf": {
+    "note": "Clean case. Phone present. Total labelled 'TOTAL DUE'. VAT separate - extract gross.",
+    "customer_name": "Mark Henderson",
+    "customer_phone": "07700 900412",
+    "project_title": "2km stock fencing",
+    "quote_total": 24504.0,
+    "currency": "GBP",
+    "expiry_date": "2026-10-11",
+    "traps": [
+      "subtotal vs total",
+      "VAT line could be mistaken for total"
+    ]
+  },
+  "au_shed.pdf": {
+    "note": "No phone anywhere - extractor MUST return null, not hallucinate. Email only.",
+    "customer_name": "Denise Okafor",
+    "customer_phone": null,
+    "project_title": "18m x 24m machinery shed",
+    "quote_total": 82840.0,
+    "currency": "AUD",
+    "expiry_date": "2026-09-25",
+    "traps": [
+      "no phone",
+      "4 stage payments could be mistaken for total",
+      "'INVESTMENT' not 'total'"
+    ]
+  },
+  "ie_groundworks.pdf": {
+    "note": "Prose, no table. Two figures - base price is the quote, the tarmac add-on is optional.",
+    "customer_name": "Padraig Ui Chonaill",
+    "customer_phone": null,
+    "project_title": "Entrance and yard groundworks",
+    "quote_total": 31750.0,
+    "currency": "EUR",
+    "expiry_date": "2026-09-30",
+    "traps": [
+      "optional extra must NOT be added to total",
+      "ex-VAT",
+      "'end of the month' expiry"
+    ]
+  }
+}

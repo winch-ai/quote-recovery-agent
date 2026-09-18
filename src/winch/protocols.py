@@ -1,0 +1,53 @@
+"""Interfaces. CONTRACT FILE — not delegated.
+
+Workers implement against these. They do not change them.
+"""
+from __future__ import annotations
+
+from typing import Protocol, runtime_checkable
+
+from pydantic import BaseModel
+
+from winch.state import Intent, Quote, QuoteDraft
+
+
+class SendResult(BaseModel):
+    ok: bool
+    provider_message_id: str | None = None
+    error_code: int | None = None   # Meta error code, e.g. 131026 (undeliverable)
+    unreachable: bool = False       # caller should transition to WHATSAPP_UNREACHABLE
+
+
+@runtime_checkable
+class ChannelAdapter(Protocol):
+    """A way to reach the customer. v1 has exactly one: WhatsApp."""
+
+    name: str
+
+    async def send_template(
+        self, to: str, template_name: str, variables: list[str]
+    ) -> SendResult: ...
+
+    async def send_freeform(self, to: str, body: str) -> SendResult:
+        """Only legal inside an open 24-hour window. Implementations MUST refuse
+        otherwise rather than silently falling back to a template."""
+        ...
+
+
+@runtime_checkable
+class LLMClient(Protocol):
+    """Every model call goes through here, so tracing and cost live in one place."""
+
+    async def extract_quote(self, media: bytes, mime_type: str) -> QuoteDraft: ...
+
+    async def classify_intent(self, text: str) -> Intent: ...
+
+    async def compose_touchpoint(
+        self, quote: Quote, template_name: str, contractor_name: str, business_name: str
+    ) -> list[str]:
+        """Return the ordered template variables.
+
+        MUST NOT return a monetary figure it generated; money comes from the frozen
+        quote and is substituted by the caller. See guards.assert_no_stray_numbers.
+        """
+        ...

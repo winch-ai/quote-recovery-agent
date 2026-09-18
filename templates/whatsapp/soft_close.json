@@ -1,0 +1,21 @@
+{
+  "name": "soft_close",
+  "language": "en_GB",
+  "category": "UTILITY",
+  "components": [
+    {
+      "type": "BODY",
+      "text": "Hi {{1}}, {{2}} from {{3}} here. I'll close off the quote for {{4}} unless you'd like me to keep it open. No problem either way, just let me know.",
+      "example": {
+        "body_text": [["Mark", "Dave", "Henderson Fencing", "2km boundary fencing"]]
+      }
+    },
+    {
+      "type": "BUTTONS",
+      "buttons": [
+        { "type": "QUICK_REPLY", "text": "Still interested" },
+        { "type": "QUICK_REPLY", "text": "Not going ahead" }
+      ]
+    }
+  ]
+}

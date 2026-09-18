@@ -1,0 +1,21 @@
+{
+  "name": "schedule_nudge",
+  "language": "en_GB",
+  "category": "UTILITY",
+  "components": [
+    {
+      "type": "BODY",
+      "text": "Hi {{1}}, {{2}} from {{3}} again. I'm allocating crew for the coming weeks and wanted to check where you're at with the {{4}} job. I can hold a slot for you if the timing works.",
+      "example": {
+        "body_text": [["Mark", "Dave", "Henderson Fencing", "2km boundary fencing"]]
+      }
+    },
+    {
+      "type": "BUTTONS",
+      "buttons": [
+        { "type": "QUICK_REPLY", "text": "Confirm dates" },
+        { "type": "QUICK_REPLY", "text": "Need to delay" }
+      ]
+    }
+  ]
+}

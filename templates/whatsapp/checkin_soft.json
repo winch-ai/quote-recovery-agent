@@ -1,0 +1,22 @@
+{
+  "name": "checkin_soft",
+  "language": "en_GB",
+  "category": "UTILITY",
+  "components": [
+    {
+      "type": "BODY",
+      "text": "Hi {{1}}, it's {{2}} from {{3}}. Following up on the quote I sent you for {{4}} ({{5}}). Happy to answer anything about the timeline or the scope before we lock in dates.",
+      "example": {
+        "body_text": [["Mark", "Dave", "Henderson Fencing", "2km boundary fencing", "GBP 24,500"]]
+      }
+    },
+    {
+      "type": "BUTTONS",
+      "buttons": [
+        { "type": "QUICK_REPLY", "text": "Any questions?" },
+        { "type": "QUICK_REPLY", "text": "Book a call" },
+        { "type": "QUICK_REPLY", "text": "Not right now" }
+      ]
+    }
+  ]
+}
