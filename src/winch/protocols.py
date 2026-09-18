@@ -8,7 +8,9 @@ from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel
 
-from winch.state import Intent, Quote, QuoteDraft
+from datetime import datetime
+
+from winch.state import Intent, Quote, QuoteDraft, Touchpoint, TouchpointStatus
 
 
 class SendResult(BaseModel):
@@ -31,6 +33,40 @@ class ChannelAdapter(Protocol):
     async def send_freeform(self, to: str, body: str) -> SendResult:
         """Only legal inside an open 24-hour window. Implementations MUST refuse
         otherwise rather than silently falling back to a template."""
+        ...
+
+
+class DueTouchpoint(BaseModel):
+    """A touchpoint the scheduler has claimed for sending."""
+
+    quote_id: str
+    touchpoint_index: int
+    due_at: datetime
+
+
+@runtime_checkable
+class TouchpointQueue(Protocol):
+    """Durable schedule of pending touchpoints.
+
+    This is deliberately a database table, not in-graph state: send timing must
+    survive restarts and must never be an LLM decision. See guards.next_business_window.
+    """
+
+    async def schedule(self, quote_id: str, touchpoints: list[Touchpoint]) -> None:
+        """Persist the plan. Idempotent on (quote_id, index)."""
+        ...
+
+    async def claim_due(self, now: datetime, limit: int = 20) -> list[DueTouchpoint]:
+        """Atomically claim touchpoints due at or before `now`.
+
+        MUST be safe under concurrent callers — Cloud Run may run several
+        instances and the tick fires on all of them. Two callers must never
+        receive the same touchpoint, or the customer gets the message twice.
+        """
+        ...
+
+    async def mark(self, quote_id: str, index: int, status: TouchpointStatus) -> None:
+        """Record a terminal status for a claimed touchpoint."""
         ...
 
 
