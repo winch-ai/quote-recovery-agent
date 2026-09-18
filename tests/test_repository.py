@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import psycopg
 from datetime import datetime, timedelta, timezone
 import os
 import pytest
@@ -421,3 +422,75 @@ async def test_no_dsn_leak_in_exception():
     assert secret_pw not in err_str
     assert bad_dsn not in err_str
     assert exc_info.value.__cause__ is None
+
+
+# --- added by Claude during audit ---------------------------------------
+# The worker's concurrency test passes even with FOR UPDATE SKIP LOCKED
+# removed, because the two claim_due() calls do not actually overlap: the
+# first commits and flips its rows out of PENDING before the second's CTE
+# evaluates. It proves serialisation, not skip-locking.
+#
+# These force a genuine overlap by holding one transaction open across the
+# other, which is the only way to observe the locking behaviour at all.
+
+async def test_claim_due_skips_rows_another_transaction_holds(pool):
+    """claim_due() itself must skip locked rows rather than block on them.
+
+    An earlier version of this test ran its own SQL with SKIP LOCKED hardcoded,
+    so it passed even when claim_due did not use it — it proved PostgreSQL's
+    semantics, not ours. This locks rows from outside and then calls the real
+    function.
+
+    Cloud Run fires the tick on every instance at once. Without SKIP LOCKED the
+    second instance blocks on the first's locks; with it, it takes the next
+    unclaimed work.
+    """
+    queue = PostgresTouchpointQueue(pool)
+    now = datetime.now(timezone.utc)
+    await queue.schedule("quote-race", [
+        Touchpoint(index=i, template_name="checkin_soft",
+                   due_at=now - timedelta(minutes=1), status=TouchpointStatus.PENDING)
+        for i in range(4)
+    ])
+
+    async with pool.connection() as holder:
+        await holder.set_autocommit(False)
+        cur = await holder.execute(
+            """SELECT touchpoint_index FROM touchpoints
+               WHERE quote_id = 'quote-race' AND status = %s
+               ORDER BY touchpoint_index LIMIT 2 FOR UPDATE""",
+            (TouchpointStatus.PENDING.value,),
+        )
+        locked = {r[0] for r in await cur.fetchall()}
+        assert len(locked) == 2
+
+        # holder's transaction is still open. A blocking claim_due hangs here,
+        # so the timeout is what turns "blocked" into an observable failure.
+        claimed = await asyncio.wait_for(queue.claim_due(now, limit=10), timeout=3.0)
+
+        got = {c.touchpoint_index for c in claimed if c.quote_id == "quote-race"}
+        assert not (got & locked), f"claim_due returned locked rows {got & locked}"
+        assert got, "claim_due skipped everything instead of taking unlocked rows"
+
+        await holder.rollback()
+
+
+async def test_without_skip_locked_a_plain_for_update_blocks(pool):
+    """Control: plain FOR UPDATE blocks, so the test above is evidence of something."""
+    queue = PostgresTouchpointQueue(pool)
+    now = datetime.now(timezone.utc)
+    await queue.schedule("quote-block", [
+        Touchpoint(index=0, template_name="checkin_soft",
+                   due_at=now - timedelta(minutes=1), status=TouchpointStatus.PENDING)
+    ])
+    blocking = """SELECT quote_id FROM touchpoints
+                  WHERE quote_id = 'quote-block' AND status = %s FOR UPDATE"""
+    async with pool.connection() as a, pool.connection() as b:
+        await a.set_autocommit(False)
+        await b.set_autocommit(False)
+        await a.execute(blocking, (TouchpointStatus.PENDING.value,))
+        await b.execute("SET LOCAL statement_timeout = '700ms'")
+        with pytest.raises(psycopg.errors.QueryCanceled):
+            await b.execute(blocking, (TouchpointStatus.PENDING.value,))
+        await a.rollback()
+        await b.rollback()
