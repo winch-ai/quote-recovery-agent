@@ -127,6 +127,31 @@ class Runtime:
                 await pool.close()
 
 
+class _LazyDeduplicator:
+    """Resolves the real deduplicator at call time, not at app-construction time.
+
+    Collaborators are built in Runtime.start(), which runs in the lifespan hook -
+    after create_app() has already wired the router. Passing runtime.deduplicator
+    directly captured None forever, and every inbound message died with an
+    AttributeError before on_event was ever called.
+    """
+
+    def __init__(self, runtime: "Runtime") -> None:
+        self._runtime = runtime
+
+    def _target(self):
+        target = self._runtime.deduplicator
+        if target is None:
+            raise RuntimeError("deduplicator unavailable: Runtime.start() has not run")
+        return target
+
+    async def seen(self, provider_message_id: str) -> bool:
+        return await self._target().seen(provider_message_id)
+
+    async def release(self, provider_message_id: str) -> None:
+        await self._target().release(provider_message_id)
+
+
 class _CombinedLLM:
     """Satisfies LLMClient by delegating to the extraction and text clients."""
 
@@ -163,7 +188,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(build_router(
         app_secret=settings.meta_app_secret,
         verify_token=settings.meta_verify_token,
-        deduplicator=runtime.deduplicator,
+        deduplicator=_LazyDeduplicator(runtime),
         on_event=on_event,
     ))
     app.include_router(_internal_router(runtime, settings))

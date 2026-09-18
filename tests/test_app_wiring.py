@@ -191,3 +191,40 @@ class TestDataDeletionPage:
 
     def test_it_states_a_deletion_deadline(self):
         assert "30 days" in self._client().get("/data-deletion").text
+
+
+class TestLazyWiring:
+    """Collaborators are built in Runtime.start(), which runs in the lifespan
+    hook - after create_app() has wired the router. Anything captured by value
+    at construction time is captured as None, forever."""
+
+    def _runtime(self, monkeypatch):
+        for k, v in {
+            "AZURE_OPENAI_ENDPOINT": "https://e.openai.azure.com",
+            "AZURE_OPENAI_API_KEY": "k", "LLM_MODEL": "azure_openai:m",
+        }.items():
+            monkeypatch.setenv(k, v)
+        from winch.app import Runtime
+        from winch.config import Settings
+        return Runtime(Settings.from_env())
+
+    async def test_lazy_deduplicator_resolves_after_start(self, monkeypatch):
+        from winch.app import _LazyDeduplicator
+        from winch.webhook import InMemoryDeduplicator
+
+        runtime = self._runtime(monkeypatch)
+        lazy = _LazyDeduplicator(runtime)          # built while it is still None
+        runtime.deduplicator = InMemoryDeduplicator()   # as Runtime.start() does
+
+        assert await lazy.seen("wamid.1") is False
+        assert await lazy.seen("wamid.1") is True
+        await lazy.release("wamid.1")
+        assert await lazy.seen("wamid.1") is False
+
+    async def test_lazy_deduplicator_raises_clearly_before_start(self, monkeypatch):
+        """A clear error beats AttributeError on NoneType, which is what shipped."""
+        from winch.app import _LazyDeduplicator
+
+        lazy = _LazyDeduplicator(self._runtime(monkeypatch))
+        with pytest.raises(RuntimeError, match="Runtime.start"):
+            await lazy.seen("wamid.1")
