@@ -8,13 +8,29 @@ description: Audit a branch produced by an agy worker before merging. Use whenev
 This is a **gate**, not a review. Findings block the merge. Work through it in order — an early
 failure invalidates the later checks, so stop and reject rather than continuing.
 
-## 1. Scope compliance — do this first
+## 0. Never trust the worker's status
+
+`agy` reports `status: SUCCESS` when its turn ends, not when the brief's
+definition of done passes. A run has been observed returning SUCCESS while its
+own final message said it was *still waiting for the test suite to finish* — and
+that suite had a failure in it.
+
+Run the definition-of-done command yourself before reading a single line of the
+diff.
+
+Compare the diff against the **merge base**, not `main`:
 
 ```bash
-git diff --stat main..task/<id>
+git diff --stat $(git merge-base main task/<id>)..task/<id>
 ```
 
-Compare against the brief's allowlist. **Any file outside it is an automatic reject**, regardless of
+A worktree created before later commits landed on `main` will otherwise show
+those commits as deletions, which reads as a catastrophic scope violation and is
+not one.
+
+## 1. Scope compliance — do this first
+
+Compare the merge-base diff above against the brief's allowlist. **Any file outside it is an automatic reject**, regardless of
 code quality. A worker that exceeded its brief cannot be trusted to have stayed in scope anywhere
 else, so nothing below is meaningful.
 

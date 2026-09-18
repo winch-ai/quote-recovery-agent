@@ -13,6 +13,24 @@ from pathlib import Path
 RUNS = Path(__file__).resolve().parent.parent / ".agy" / "runs"
 
 
+def _load(path: Path):
+    """agy writes progress chatter to stderr; when both streams share a file the
+    JSON is no longer the whole file. Take the last line that parses."""
+    text = path.read_text()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+    return None
+
+
 def main():
     if not RUNS.exists() or not any(RUNS.glob("*.json")):
         print("no runs recorded yet")
@@ -20,10 +38,9 @@ def main():
 
     rows, totals = [], {"input": 0, "output": 0, "thinking": 0, "cached": 0, "secs": 0.0}
     for path in sorted(RUNS.glob("*.json")):
-        try:
-            data = json.loads(path.read_text())
-        except json.JSONDecodeError:
-            print(f"  UNPARSEABLE  {path.name}  (agy likely errored - check the file)")
+        data = _load(path)
+        if data is None:
+            print(f"  UNPARSEABLE  {path.name}  (no JSON object found - check the file)")
             continue
         usage = data.get("usage", {})
         rows.append((path.stem, data.get("status", "?"), usage.get("input_tokens", 0),

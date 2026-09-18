@@ -67,8 +67,11 @@ agy -p "$(cat briefs/<task-id>.md)" \
     --model gemini-3.8-flash-medium \
     --output-format json \
     --sandbox \
-    > ../../.agy/runs/<task-id>.json 2>&1
+    > ../../.agy/runs/<task-id>.json 2> ../../.agy/runs/<task-id>.stderr
 ```
+
+**Keep the streams separate.** `agy` writes progress chatter to stderr; merging
+them with `2>&1` corrupts the JSON run record that cost tracing depends on.
 
 - `--model gemini-3.8-flash-medium` — effort is baked into the model id; do not also pass `--effort`.
 - `--sandbox` preferred. Use `--dangerously-skip-permissions` **only** inside an isolated worktree
@@ -92,7 +95,17 @@ disjoint.** This is the regression guard — it is not possible for concurrent w
 each other's functionality if no two of them can write the same file. Overlapping allowlists are
 serialised, no exceptions.
 
-## 5. The audit gate
+## 5. The worker's own status is not evidence
+
+`agy` reports `status: SUCCESS` based on its own turn completing, not on the
+brief's definition of done. Observed in practice: a run returned SUCCESS with a
+final message of *"I have launched the pytest suite and am waiting for execution
+to complete"* — it never saw the result, and the suite had a failure in it.
+
+**Always run the definition-of-done command yourself.** Treat the status field
+as "the process exited", nothing more.
+
+## 6. The audit gate
 
 No branch merges without passing the audit in `.claude/skills/agy-audit/SKILL.md`. Run it on every
 returned branch. It is a gate, not a review — findings block the merge.
@@ -101,7 +114,7 @@ The single highest-yield check: `git diff --stat main..task/<id>` against the br
 file outside the allowlist is an automatic reject regardless of whether the code is good, because it
 means the worker exceeded its brief and nothing else it did can be trusted to be in scope.
 
-## 6. Cost tracing
+## 7. Cost tracing
 
 Every run writes `.agy/runs/<task-id>.json` containing the `usage` block. Aggregate with:
 
@@ -112,7 +125,7 @@ python scripts/agy_ledger.py
 Track cost per *merged* task, not per run. A cheap run that gets rejected and redone twice is the
 expensive one.
 
-## 7. Merge
+## 8. Merge
 
 1. Audit passes.
 2. Rebase onto `main`.
