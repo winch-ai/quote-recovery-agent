@@ -258,6 +258,32 @@ class TestLogging:
             logging.getLogger("winch.app").info("intake: quote=%s", "q1")
         assert any("intake: quote=q1" in r.getMessage() for r in caplog.records)
 
+    def test_no_argument_path_works(self, monkeypatch):
+        """configure_logging() with no argument reads os.environ.
+
+        Every other test passed an explicit level, so this branch was never
+        executed - and it shipped with `os` unimported, crashing the container
+        on startup with a NameError.
+        """
+        import logging
+
+        from winch.app import configure_logging
+
+        monkeypatch.delenv("LOG_LEVEL", raising=False)
+        configure_logging()
+        assert logging.getLogger("winch").isEnabledFor(logging.INFO)
+
+    def test_log_level_env_var_is_honoured(self, monkeypatch):
+        import logging
+
+        from winch.app import configure_logging
+
+        monkeypatch.setenv("LOG_LEVEL", "WARNING")
+        configure_logging()
+        assert not logging.getLogger("winch").isEnabledFor(logging.INFO)
+        monkeypatch.delenv("LOG_LEVEL")
+        configure_logging()
+
     def test_level_is_overridable(self):
         import logging
 
@@ -266,3 +292,32 @@ class TestLogging:
         configure_logging("WARNING")
         assert not logging.getLogger("winch").isEnabledFor(logging.INFO)
         configure_logging("INFO")
+
+
+class TestAppBoots:
+    """A container-shaped smoke test.
+
+    create_app() crashed on startup with a NameError because configure_logging
+    used os.environ while `os` was unimported - and every unit test passed an
+    explicit level, so that branch never ran. Building the whole app the way the
+    container does catches this class of error before a deploy does.
+    """
+
+    def _env(self, monkeypatch):
+        for k, v in {
+            "AZURE_OPENAI_ENDPOINT": "https://e.openai.azure.com",
+            "AZURE_OPENAI_API_KEY": "k", "LLM_MODEL": "azure_openai:m",
+        }.items():
+            monkeypatch.setenv(k, v)
+
+    def test_create_app_succeeds(self, monkeypatch):
+        self._env(monkeypatch)
+        from winch.app import create_app
+        assert create_app() is not None
+
+    def test_every_expected_route_is_served(self, monkeypatch):
+        self._env(monkeypatch)
+        from winch.app import create_app
+        paths = set(create_app().openapi()["paths"])
+        assert {"/webhook/meta", "/internal/tick", "/internal/events",
+                "/health", "/privacy", "/terms", "/data-deletion"} <= paths

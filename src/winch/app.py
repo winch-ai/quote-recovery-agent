@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hmac
 import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -46,10 +47,14 @@ def configure_logging(level: str | None = None) -> None:
     looked like silence.
     """
     resolved = (level or os.environ.get("LOG_LEVEL") or "INFO").upper()
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
     root = logging.getLogger()
-    root.handlers = [handler]
+    # Add a handler only when nothing has configured one. Replacing the list
+    # wholesale would discard handlers the host has installed - pytest's caplog,
+    # or a platform log shipper - which is a worse failure than a duplicate line.
+    if not root.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+        root.addHandler(handler)
     root.setLevel(resolved)
     logging.getLogger("winch").setLevel(resolved)
 
