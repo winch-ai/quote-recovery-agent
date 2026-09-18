@@ -21,6 +21,7 @@ from winch.compose import ContractorProfile
 from winch.config import Settings
 from winch.db import init_schema, make_pool
 from winch.graph import Entry, build_graph
+from winch.legal import build_router as build_legal_router
 from winch.llm.azure import AzureExtractor, AzureTextClient
 from winch.nodes import Deps, new_quote_id
 from winch.repository import (
@@ -166,6 +167,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         on_event=on_event,
     ))
     app.include_router(_internal_router(runtime, settings))
+    app.include_router(build_legal_router(
+        contact_email=settings.privacy_contact_email,
+        operator_name=settings.privacy_operator_name,
+    ))
     return app
 
 

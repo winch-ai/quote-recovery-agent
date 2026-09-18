@@ -122,3 +122,45 @@ class TestTickAuth:
         never reaches the container, so the endpoint must not live there."""
         client = self._app(monkeypatch, "s3cret")
         assert client.get("/healthz").status_code == 404
+
+
+class TestLegalPages:
+    """Meta will not let an app leave Development mode without a Privacy Policy
+    URL. These are served by the app because there is no domain yet."""
+
+    def _client(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from winch.legal import build_router
+        app = FastAPI()
+        app.include_router(build_router("ops@example.com", "Example Ltd"))
+        return TestClient(app)
+
+    def test_privacy_is_publicly_reachable(self):
+        assert self._client().get("/privacy").status_code == 200
+
+    def test_terms_is_publicly_reachable(self):
+        assert self._client().get("/terms").status_code == 200
+
+    def test_privacy_names_every_third_party_that_sees_customer_data(self):
+        """If a processor is added and not listed here, the policy is false."""
+        body = self._client().get("/privacy").text
+        for processor in ("Meta", "Azure OpenAI", "Google Cloud"):
+            assert processor in body, f"{processor} not disclosed"
+
+    def test_privacy_states_the_stop_route(self):
+        body = self._client().get("/privacy").text
+        assert "STOP" in body
+
+    def test_contact_email_is_rendered_when_configured(self):
+        assert "ops@example.com" in self._client().get("/privacy").text
+
+    def test_no_contact_email_degrades_without_breaking(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from winch.legal import build_router
+        app = FastAPI()
+        app.include_router(build_router("", "Example Ltd"))
+        resp = TestClient(app).get("/privacy")
+        assert resp.status_code == 200
+        assert "mailto:" not in resp.text

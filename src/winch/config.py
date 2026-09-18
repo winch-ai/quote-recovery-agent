@@ -48,6 +48,11 @@ class Settings:
     contractor_business_name: str = ""
     contractor_timezone: str = "Europe/London"
 
+    # Shown on the public /privacy page, which Meta requires before an app can
+    # be switched from Development to Live.
+    privacy_contact_email: str = ""
+    privacy_operator_name: str = "the operator of this service"
+
     @classmethod
     def from_env(cls) -> "Settings":
         raw = os.environ.get("LLM_MODEL", "")
@@ -70,4 +75,7 @@ class Settings:
             contractor_first_name=os.environ.get("CONTRACTOR_FIRST_NAME", ""),
             contractor_business_name=os.environ.get("CONTRACTOR_BUSINESS_NAME", ""),
             contractor_timezone=os.environ.get("CONTRACTOR_TIMEZONE", "Europe/London"),
+            privacy_contact_email=os.environ.get("PRIVACY_CONTACT_EMAIL", ""),
+            privacy_operator_name=os.environ.get(
+                "PRIVACY_OPERATOR_NAME", "the operator of this service"),
         )
