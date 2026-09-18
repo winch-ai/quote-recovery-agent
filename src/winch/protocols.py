@@ -102,12 +102,13 @@ class LLMClient(Protocol):
 
     async def classify_intent(self, text: str) -> Intent: ...
 
-    async def compose_touchpoint(
-        self, quote: Quote, template_name: str, contractor_name: str, business_name: str
-    ) -> list[str]:
-        """Return the ordered template variables.
+    async def compose_reply(self, quote: Quote, customer_message: str) -> str:
+        """Draft a free-form reply. Only legal inside an open 24-hour window.
 
-        MUST NOT return a monetary figure it generated; money comes from the frozen
-        quote and is substituted by the caller. See guards.assert_no_stray_numbers.
+        The result is passed through guards.assert_no_stray_numbers before it can
+        be sent, so any number the model invents is rejected rather than
+        delivered. Template touchpoints do NOT come through here — their
+        variables are filled in code by winch.compose, because every one of them
+        already exists in frozen state.
         """
         ...
