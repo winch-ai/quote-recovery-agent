@@ -1,10 +1,19 @@
+# --- secrets: never commit, no exceptions ---
+.env
+.env.*
+!.env.example
+.envrc
+secrets/
+*.pem
+*.key
+credentials.json
+service-account*.json
+# fixtures/env/sample.env is intentionally tracked: fake values, used by tests
+
 __pycache__/
 *.py[cod]
 .venv/
 venv/
-.env
-.env.*
-!.env.example
 *.log
 .pytest_cache/
 .ruff_cache/

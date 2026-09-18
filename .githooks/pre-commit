@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Blocks secrets from entering history. Enable once with:
+#     git config core.hooksPath .githooks
+#
+# History is forever: a secret committed and then removed is still a secret that
+# must be rotated. This hook is cheap insurance against that.
+set -euo pipefail
+
+staged="$(git diff --cached --name-only --diff-filter=ACM)"
+[[ -z "$staged" ]] && exit 0
+
+fail=0
+
+# 1. Secret-bearing filenames, regardless of content.
+while IFS= read -r f; do
+  case "$(basename "$f")" in
+    .env|.env.*|credentials.json|service-account*.json|*.pem|*.key)
+      [[ "$f" == ".env.example" ]] && continue
+      echo "BLOCKED: $f looks like a secrets file and must not be committed." >&2
+      fail=1 ;;
+  esac
+done <<< "$staged"
+
+# 2. Token-shaped strings in content. The fixture is exempt: its values are fake
+#    and the tests assert on them.
+patterns='(sk-[A-Za-z0-9]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|AIza[0-9A-Za-z_-]{30,})'
+while IFS= read -r f; do
+  [[ "$f" == "fixtures/env/sample.env" ]] && continue
+  [[ "$f" == ".githooks/pre-commit" ]] && continue
+  [[ -f "$f" ]] || continue
+  if git show ":$f" 2>/dev/null | grep -qE "$patterns"; then
+    echo "BLOCKED: $f contains something token-shaped." >&2
+    fail=1
+  fi
+done <<< "$staged"
+
+if [[ "$fail" == "1" ]]; then
+  echo "" >&2
+  echo "Commit refused. If a value is genuinely fake, add the file to the hook's" >&2
+  echo "exempt list explicitly rather than bypassing with --no-verify." >&2
+  exit 1
+fi
