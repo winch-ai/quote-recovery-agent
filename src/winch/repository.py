@@ -1,0 +1,190 @@
+"""Postgres implementations of persistence protocols."""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
+
+from psycopg.types.json import Jsonb
+from psycopg_pool import AsyncConnectionPool
+
+from winch.events import EventSink, EventType
+from winch.protocols import DueTouchpoint, MessageDeduplicator, TouchpointQueue
+from winch.state import Touchpoint, TouchpointStatus
+
+
+class PostgresTouchpointQueue:
+    """Postgres-backed durable touchpoint queue satisfying TouchpointQueue protocol."""
+
+    def __init__(self, pool: AsyncConnectionPool) -> None:
+        self._pool = pool
+
+    async def schedule(self, quote_id: str, touchpoints: list[Touchpoint]) -> None:
+        """Persist the plan. Idempotent on (quote_id, touchpoint_index).
+
+        Calling twice with the same touchpoints must not duplicate rows and must
+        not reset the status of a row already progressed.
+        """
+        if not touchpoints:
+            return
+
+        params = [
+            (
+                quote_id,
+                tp.index,
+                tp.template_name,
+                tp.due_at if tp.due_at.tzinfo is not None else tp.due_at.replace(tzinfo=timezone.utc),
+                tp.status.value if hasattr(tp.status, "value") else str(tp.status),
+                tp.provider_message_id,
+            )
+            for tp in touchpoints
+        ]
+
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.executemany(
+                    """
+                    INSERT INTO touchpoints (
+                        quote_id,
+                        touchpoint_index,
+                        template_name,
+                        due_at,
+                        status,
+                        provider_message_id
+                    ) VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (quote_id, touchpoint_index) DO NOTHING;
+                    """,
+                    params,
+                )
+
+    async def claim_due(self, now: datetime, limit: int = 20) -> list[DueTouchpoint]:
+        """Atomically claim touchpoints due at or before `now`.
+
+        Returns only PENDING touchpoints with due_at <= now, marks them
+        AWAITING_GATE and sets claimed_at, all in one transaction using
+        FOR UPDATE SKIP LOCKED.
+        """
+        if limit <= 0:
+            return []
+
+        now_utc = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+
+        sql = """
+        WITH due AS (
+            SELECT quote_id, touchpoint_index, due_at
+            FROM touchpoints
+            WHERE status = %s AND due_at <= %s
+            ORDER BY due_at ASC, quote_id ASC, touchpoint_index ASC
+            LIMIT %s
+            FOR UPDATE SKIP LOCKED
+        )
+        UPDATE touchpoints t
+        SET status = %s,
+            claimed_at = now()
+        FROM due
+        WHERE t.quote_id = due.quote_id
+          AND t.touchpoint_index = due.touchpoint_index
+        RETURNING t.quote_id, t.touchpoint_index, t.due_at;
+        """
+
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    sql,
+                    (
+                        TouchpointStatus.PENDING.value,
+                        now_utc,
+                        limit,
+                        TouchpointStatus.AWAITING_GATE.value,
+                    ),
+                )
+                rows = await cur.fetchall()
+
+        return [
+            DueTouchpoint(
+                quote_id=row[0],
+                touchpoint_index=row[1],
+                due_at=row[2],
+            )
+            for row in rows
+        ]
+
+    async def mark(self, quote_id: str, index: int, status: TouchpointStatus) -> None:
+        """Record a terminal status for a claimed touchpoint."""
+        status_str = status.value if hasattr(status, "value") else str(status)
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE touchpoints
+                    SET status = %s
+                    WHERE quote_id = %s AND touchpoint_index = %s;
+                    """,
+                    (status_str, quote_id, index),
+                )
+
+
+class PostgresDeduplicator:
+    """Postgres-backed message deduplicator satisfying MessageDeduplicator protocol."""
+
+    def __init__(self, pool: AsyncConnectionPool) -> None:
+        self._pool = pool
+
+    async def seen(self, provider_message_id: str) -> bool:
+        """Claim the id atomically. Return True only if it was already present."""
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO processed_messages (provider_message_id, seen_at)
+                    VALUES (%s, now())
+                    ON CONFLICT (provider_message_id) DO NOTHING
+                    RETURNING provider_message_id;
+                    """,
+                    (provider_message_id,),
+                )
+                row = await cur.fetchone()
+                return row is None
+
+    async def release(self, provider_message_id: str) -> None:
+        """Un-claim an id whose handler failed, so redelivery can retry it."""
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    DELETE FROM processed_messages
+                    WHERE provider_message_id = %s;
+                    """,
+                    (provider_message_id,),
+                )
+
+
+class PostgresEventSink:
+    """Postgres-backed event sink satisfying EventSink protocol."""
+
+    def __init__(self, pool: AsyncConnectionPool) -> None:
+        self._pool = pool
+
+    async def write(
+        self,
+        quote_id: str,
+        event_type: EventType,
+        payload: dict[str, Any] | None = None,
+        at: datetime | None = None,
+    ) -> None:
+        """Persist an event to the events table. Never silently drop a row."""
+        event_type_str = event_type.value if hasattr(event_type, "value") else str(event_type)
+        payload_param = Jsonb(payload) if payload is not None else None
+        at_param = (
+            at if (at is None or at.tzinfo is not None)
+            else at.replace(tzinfo=timezone.utc)
+        )
+
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO events (quote_id, event_type, payload, at)
+                    VALUES (%s, %s, %s, COALESCE(%s, now()));
+                    """,
+                    (quote_id, event_type_str, payload_param, at_param),
+                )
