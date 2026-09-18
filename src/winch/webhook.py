@@ -368,6 +368,25 @@ def build_router(
             return Response(content="OK", status_code=200)
 
         events = parse_webhook(payload)
+        # Structural diagnostic: message types and field names only, never
+        # bodies, numbers or media content. Enough to tell a parser miss from a
+        # routing miss, which guesswork could not.
+        try:
+            shapes = []
+            for entry in payload.get("entry", []) or []:
+                for change in entry.get("changes", []) or []:
+                    value = change.get("value", {}) or {}
+                    for m in value.get("messages", []) or []:
+                        shapes.append({"type": m.get("type"), "keys": sorted(m.keys())})
+                    for st in value.get("statuses", []) or []:
+                        shapes.append({"status": st.get("status")})
+            logger.info("webhook shape: field=%s items=%s parsed=%d",
+                        (payload.get("entry", [{}]) or [{}])[0].get("changes", [{}])[0].get("field")
+                        if payload.get("entry") else None,
+                        shapes, len(events))
+        except Exception:
+            logger.exception("shape diagnostic failed (non-fatal)")
+
         for event in events:
             try:
                 already_seen = await deduplicator.seen(event.provider_message_id)

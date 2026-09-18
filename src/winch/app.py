@@ -205,6 +205,11 @@ async def _handle(runtime: Runtime, settings: Settings, event: ParsedEvent) -> N
         return
 
     from_contractor = event.from_wa_id == settings.contractor_wa_id
+    logger.info(
+        "routing: kind=%s from_matches_contractor=%s has_media=%s has_text=%s has_button=%s",
+        event.kind, from_contractor, event.media_id is not None,
+        event.text is not None, event.button_payload is not None,
+    )
 
     if from_contractor and event.media_id:
         quote_id = new_quote_id()
