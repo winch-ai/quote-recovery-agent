@@ -1,0 +1,242 @@
+"""FastAPI surface: the Meta webhook, the scheduler tick, and health.
+
+The webhook translates Meta events into graph invocations; the tick drains the
+durable touchpoint queue. Neither contains business logic — routing lives in
+winch.supervisor and the flow lives in winch.graph.
+"""
+from __future__ import annotations
+
+import logging
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, FastAPI
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.types import Command
+
+from winch.channels.whatsapp import WhatsAppChannel
+from winch.compose import ContractorProfile
+from winch.config import Settings
+from winch.db import init_schema, make_pool
+from winch.graph import Entry, build_graph
+from winch.llm.azure import AzureExtractor, AzureTextClient
+from winch.nodes import Deps, new_quote_id
+from winch.repository import (
+    PostgresDeduplicator,
+    PostgresEventSink,
+    PostgresTouchpointQueue,
+)
+from winch.state import InboundMessage, QuoteStatus
+from winch.webhook import ParsedEvent, build_router
+
+logger = logging.getLogger(__name__)
+
+
+class Runtime:
+    """Everything built once at boot and reused per request."""
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.pool = None
+        self.graph = None
+        self.deduplicator = None
+        self.queue = None
+        self.events = None
+
+    async def start(self) -> None:
+        s = self.settings
+        self.pool = await make_pool(s.database_url)
+        await init_schema(self.pool)
+
+        self.queue = PostgresTouchpointQueue(self.pool)
+        self.events = PostgresEventSink(self.pool)
+        self.deduplicator = PostgresDeduplicator(self.pool)
+
+        channel = WhatsAppChannel(
+            phone_number_id=s.meta_phone_number_id,
+            access_token=s.meta_access_token,
+            graph_version=s.meta_graph_version,
+            window_checker=self._window_open,
+        )
+        extractor = AzureExtractor(s.azure_endpoint, s.azure_api_key,
+                                   s.azure_deployment, s.azure_api_version)
+        text = AzureTextClient(s.azure_endpoint, s.azure_api_key,
+                               s.azure_deployment, s.azure_api_version)
+
+        deps = Deps(
+            llm=_CombinedLLM(extractor, text),
+            channel=channel,
+            contractor_channel=channel,
+            events=self.events,
+            queue=self.queue,
+            contractor=ContractorProfile(
+                contractor_id="pilot",
+                first_name=s.contractor_first_name,
+                business_name=s.contractor_business_name,
+                wa_id=s.contractor_wa_id,
+                timezone=s.contractor_timezone,
+            ),
+            media_fetch=channel.download_media,
+        )
+
+        checkpointer = AsyncPostgresSaver(self.pool)
+        await checkpointer.setup()
+        self.graph = build_graph(deps, checkpointer=checkpointer)
+
+    async def _window_open(self, to: str) -> bool:
+        """A 24-hour window is open only if that number messaged us recently.
+
+        Fails closed: any error means 'not open', so a failure can never cause
+        an out-of-window free-form send.
+        """
+        try:
+            async with self.pool.connection() as conn:
+                cur = await conn.execute(
+                    """SELECT 1 FROM events
+                       WHERE event_type = 'customer_replied'
+                         AND payload->>'from' = %s
+                         AND at > now() - interval '24 hours' LIMIT 1""",
+                    (to,),
+                )
+                return await cur.fetchone() is not None
+        except Exception:
+            logger.exception("window check failed for a recipient; failing closed")
+            return False
+
+    async def stop(self) -> None:
+        if self.pool is not None:
+            await self.pool.close()
+
+
+class _CombinedLLM:
+    """Satisfies LLMClient by delegating to the extraction and text clients."""
+
+    def __init__(self, extractor, text):
+        self._extractor, self._text = extractor, text
+
+    async def extract_quote(self, media: bytes, mime_type: str):
+        return await self._extractor.extract_quote(media, mime_type)
+
+    async def classify_intent(self, text: str):
+        return await self._text.classify_intent(text)
+
+    async def compose_reply(self, quote, customer_message: str) -> str:
+        return await self._text.compose_reply(quote, customer_message)
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    settings = settings or Settings.from_env()
+    runtime = Runtime(settings)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        await runtime.start()
+        try:
+            yield
+        finally:
+            await runtime.stop()
+
+    app = FastAPI(title="Winch", lifespan=lifespan)
+
+    async def on_event(event: ParsedEvent) -> None:
+        await _handle(runtime, settings, event)
+
+    app.include_router(build_router(
+        app_secret=settings.meta_app_secret,
+        verify_token=settings.meta_verify_token,
+        deduplicator=runtime.deduplicator,
+        on_event=on_event,
+    ))
+    app.include_router(_internal_router(runtime))
+    return app
+
+
+async def _handle(runtime: Runtime, settings: Settings, event: ParsedEvent) -> None:
+    """Translate one Meta event into a graph invocation."""
+    if event.kind == "status":
+        return
+
+    from_contractor = event.from_wa_id == settings.contractor_wa_id
+
+    if from_contractor and event.media_id:
+        quote_id = new_quote_id()
+        await runtime.graph.ainvoke(
+            {"quote_id": quote_id, "media_id": event.media_id,
+             "status": QuoteStatus.DRAFT, "_entry": Entry.INTAKE},
+            {"configurable": {"thread_id": quote_id}},
+        )
+        return
+
+    if from_contractor:
+        # A reply from the contractor resumes whichever interrupt is pending.
+        thread = await _pending_thread(runtime, event.from_wa_id)
+        if thread is None:
+            logger.info("contractor message with no pending interrupt; ignoring")
+            return
+        await runtime.graph.ainvoke(
+            Command(resume=_parse_contractor_reply(event)),
+            {"configurable": {"thread_id": thread}},
+        )
+        return
+
+    thread = await _thread_for_customer(runtime, event.from_wa_id)
+    if thread is None:
+        logger.info("inbound from an unknown number; ignoring")
+        return
+    inbound = InboundMessage(
+        provider_message_id=event.provider_message_id, from_customer=True,
+        text=event.text or event.button_payload or "",
+        received_at=event.timestamp,
+    )
+    await runtime.graph.ainvoke(
+        {"_entry": Entry.INBOUND, "inbound": [inbound]},
+        {"configurable": {"thread_id": thread}},
+    )
+
+
+def _parse_contractor_reply(event: ParsedEvent) -> dict:
+    """Map a button tap or a plain reply onto a resume payload."""
+    payload = (event.button_payload or event.text or "").strip().lower()
+    if payload in {"yes", "approve", "send", "ok", "start", "1"}:
+        return {"approved": True}
+    if payload in {"no", "hold", "stop", "cancel", "0"}:
+        return {"approved": False}
+    return {"text": event.text or ""}
+
+
+async def _pending_thread(runtime: Runtime, wa_id: str) -> str | None:
+    raise NotImplementedError("thread lookup — see briefs/thread-lookup.md")
+
+
+async def _thread_for_customer(runtime: Runtime, wa_id: str) -> str | None:
+    raise NotImplementedError("thread lookup — see briefs/thread-lookup.md")
+
+
+def _internal_router(runtime: Runtime) -> APIRouter:
+    router = APIRouter()
+
+    @router.get("/healthz")
+    async def healthz() -> dict:
+        return {"ok": True}
+
+    @router.post("/internal/tick")
+    async def tick() -> dict:
+        """Drain the durable queue. Cloud Scheduler calls this every 5 minutes.
+
+        claim_due is atomic under concurrency, so several instances ticking at
+        once cannot claim the same touchpoint.
+        """
+        now = datetime.now(timezone.utc)
+        claimed = await runtime.queue.claim_due(now)
+        for due in claimed:
+            try:
+                await runtime.graph.ainvoke(
+                    {"_entry": Entry.TICK, "pending_gate_index": due.touchpoint_index},
+                    {"configurable": {"thread_id": due.quote_id}},
+                )
+            except Exception:
+                logger.exception("tick failed for %s/%s", due.quote_id,
+                                 due.touchpoint_index)
+        return {"claimed": len(claimed)}
+
+    return router

@@ -1,0 +1,250 @@
+"""End-to-end graph spec, with fakes. No network, no database.
+
+test_no_edge_reaches_send_except_from_the_gate is the load-bearing one. The
+supervisor test proves the property over the routing table; this proves it over
+the compiled graph, which is what actually executes. Both must hold — a correct
+table wired up wrongly still sends without a gate.
+"""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+import pytest
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import Command
+
+from winch.compose import ContractorProfile
+from winch.events import EventType
+from winch.graph import Entry, build_graph
+from winch.nodes import Deps
+from winch.protocols import SendResult
+from winch.state import ChannelState, Intent, InboundMessage, QuoteDraft, QuoteStatus
+from winch.supervisor import Node
+
+DRAFT = QuoteDraft(
+    customer_name="Mark Henderson", customer_phone="447700900412",
+    customer_email=None, project_title="2km stock fencing",
+    scope_summary="Supply and install", quote_total=24504.0,
+    currency="GBP", expiry_date="2026-10-11",
+)
+
+
+class FakeLLM:
+    def __init__(self, draft=DRAFT, intent=Intent.QUESTION_ON_TIMELINE, fail=False):
+        self._draft, self._intent, self._fail = draft, intent, fail
+
+    async def extract_quote(self, media, mime_type):
+        if self._fail:
+            raise RuntimeError("boom")
+        return self._draft
+
+    async def classify_intent(self, text):
+        return self._intent
+
+    async def compose_reply(self, quote, customer_message):
+        return "ok"
+
+
+class FakeChannel:
+    name = "fake"
+
+    def __init__(self, result=None):
+        self.result = result or SendResult(ok=True, provider_message_id="wamid.1")
+        self.templates, self.freeforms = [], []
+
+    async def send_template(self, to, template_name, variables):
+        self.templates.append((to, template_name, variables))
+        return self.result
+
+    async def send_freeform(self, to, body):
+        self.freeforms.append((to, body))
+        return SendResult(ok=True, provider_message_id="wamid.2")
+
+
+class FakeEvents:
+    def __init__(self):
+        self.rows = []
+
+    async def write(self, quote_id, event_type, payload=None, at=None):
+        self.rows.append((quote_id, event_type, payload or {}))
+
+    def types(self):
+        return [t for _, t, _ in self.rows]
+
+
+class FakeQueue:
+    def __init__(self):
+        self.scheduled, self.marks = [], []
+
+    async def schedule(self, quote_id, touchpoints):
+        self.scheduled.append((quote_id, touchpoints))
+
+    async def claim_due(self, now, limit=20):
+        return []
+
+    async def mark(self, quote_id, index, status):
+        self.marks.append((quote_id, index, status))
+
+
+CONTRACTOR = ContractorProfile(
+    contractor_id="c1", first_name="Dave", business_name="Henderson Fencing",
+    wa_id="447700900001", timezone="Europe/London",
+)
+
+
+def make(llm=None, channel=None):
+    ch = channel or FakeChannel()
+    deps = Deps(
+        llm=llm or FakeLLM(), channel=ch, contractor_channel=ch,
+        events=FakeEvents(), queue=FakeQueue(), contractor=CONTRACTOR,
+        media_fetch=_fake_media,
+    )
+    return deps, build_graph(deps, checkpointer=MemorySaver())
+
+
+async def _fake_media(media_id):
+    return b"%PDF-fake", "application/pdf"
+
+
+def cfg(thread):
+    return {"configurable": {"thread_id": thread}}
+
+
+class TestSafetyProperties:
+    def test_no_edge_reaches_send_except_from_the_gate(self):
+        """Proven over the compiled graph, not just the routing table."""
+        _, graph = make()
+        edges = graph.get_graph().edges
+        into_send = {e.source for e in edges if e.target == Node.SEND.value}
+        assert into_send == {Node.GATE.value}, (
+            f"SEND is reachable from {into_send - {Node.GATE.value}} without a gate"
+        )
+
+    def test_gate_is_always_preceded_by_compose(self):
+        _, graph = make()
+        edges = graph.get_graph().edges
+        into_gate = {e.source for e in edges if e.target == Node.GATE.value}
+        assert into_gate == {Node.COMPOSE.value}
+
+    def test_every_supervisor_node_except_idle_exists_in_the_graph(self):
+        """Stops the table and the wiring drifting apart."""
+        _, graph = make()
+        present = set(graph.get_graph().nodes)
+        expected = {n.value for n in Node if n is not Node.IDLE}
+        assert expected <= present, f"missing nodes: {expected - present}"
+
+
+class TestIntakeFlow:
+    async def test_parks_at_collect_contact_then_at_confirm(self):
+        deps, graph = make()
+        state = {"quote_id": "q1", "media_id": "m1", "status": QuoteStatus.DRAFT,
+                 "_entry": Entry.INTAKE}
+
+        result = await graph.ainvoke(state, cfg("t1"))
+        assert result["__interrupt__"][0].value["kind"] == "collect_contact"
+
+        result = await graph.ainvoke(Command(resume={}), cfg("t1"))
+        assert result["__interrupt__"][0].value["kind"] == "confirm_quote"
+
+        final = await graph.ainvoke(Command(resume={"approved": True}), cfg("t1"))
+        assert final["status"] is QuoteStatus.ACTIVE
+        assert final["quote"].frozen is True
+        assert final["quote"].quote_total == 24504.0
+        assert len(deps.queue.scheduled) == 1
+
+    async def test_declining_closes_without_scheduling(self):
+        deps, graph = make()
+        state = {"quote_id": "q2", "media_id": "m1", "status": QuoteStatus.DRAFT,
+                 "_entry": Entry.INTAKE}
+        await graph.ainvoke(state, cfg("t2"))
+        await graph.ainvoke(Command(resume={}), cfg("t2"))
+        final = await graph.ainvoke(Command(resume={"approved": False}), cfg("t2"))
+        assert final["status"] is QuoteStatus.CLOSED
+        assert deps.queue.scheduled == []
+
+    async def test_extraction_failure_alerts_instead_of_dying_quietly(self):
+        deps, graph = make(llm=FakeLLM(fail=True))
+        state = {"quote_id": "q3", "media_id": "m1", "status": QuoteStatus.DRAFT,
+                 "_entry": Entry.INTAKE}
+        final = await graph.ainvoke(state, cfg("t3"))
+        assert EventType.PARSE_FAILED in deps.events.types()
+        assert final["status"] is QuoteStatus.HALTED
+
+
+class TestTickFlow:
+    async def _approved_quote(self, graph, thread, qid):
+        state = {"quote_id": qid, "media_id": "m1", "status": QuoteStatus.DRAFT,
+                 "_entry": Entry.INTAKE}
+        await graph.ainvoke(state, cfg(thread))
+        await graph.ainvoke(Command(resume={}), cfg(thread))
+        return await graph.ainvoke(Command(resume={"approved": True}), cfg(thread))
+
+    async def test_gate_hold_sends_nothing(self):
+        """A held touchpoint must produce zero outbound messages."""
+        deps, graph = make()
+        await self._approved_quote(graph, "t4", "q4")
+        await graph.ainvoke(
+            {"_entry": Entry.TICK, "pending_gate_index": 0}, cfg("t4")
+        )
+        final = await graph.ainvoke(Command(resume={"approved": False}), cfg("t4"))
+        assert deps.channel.templates == [], "a held gate still sent a message"
+        assert EventType.GATE_HELD in deps.events.types()
+        assert EventType.TOUCHPOINT_SENT not in deps.events.types()
+
+    async def test_gate_approval_sends_the_template(self):
+        deps, graph = make()
+        await self._approved_quote(graph, "t5", "q5")
+        await graph.ainvoke({"_entry": Entry.TICK, "pending_gate_index": 0}, cfg("t5"))
+        await graph.ainvoke(Command(resume={"approved": True}), cfg("t5"))
+        assert len(deps.channel.templates) == 1
+        to, template, variables = deps.channel.templates[0]
+        assert to == "447700900412"
+        assert template == "checkin_soft"
+        assert "GBP 24,504.00" in variables
+        assert EventType.TOUCHPOINT_SENT in deps.events.types()
+
+    async def test_unreachable_customer_falls_back_to_relay(self):
+        """No email channel in v1; the contractor is handed the text instead."""
+        channel = FakeChannel(SendResult(ok=False, error_code=131026, unreachable=True))
+        deps, graph = make(channel=channel)
+        await self._approved_quote(graph, "t6", "q6")
+        await graph.ainvoke({"_entry": Entry.TICK, "pending_gate_index": 0}, cfg("t6"))
+        final = await graph.ainvoke(Command(resume={"approved": True}), cfg("t6"))
+        assert final["channel"] is ChannelState.WHATSAPP_UNREACHABLE
+        assert EventType.CHANNEL_UNAVAILABLE in deps.events.types()
+        assert EventType.RELAYED_TO_CONTRACTOR in deps.events.types()
+        assert deps.channel.freeforms, "contractor was not given the text to send"
+
+
+class TestInboundFlow:
+    async def test_customer_reply_halts_and_alerts(self):
+        """Every reply halts. A sequence that keeps running after the customer
+        engages is the behaviour this audience calls sleazy."""
+        deps, graph = make()
+        inbound = InboundMessage(
+            provider_message_id="wamid.in1", from_customer=True,
+            text="Does that include site clearing?",
+            received_at=datetime.now(timezone.utc),
+        )
+        final = await graph.ainvoke(
+            {"quote_id": "q7", "status": QuoteStatus.ACTIVE, "_entry": Entry.INBOUND,
+             "inbound": [inbound]},
+            cfg("t7"),
+        )
+        assert final["status"] is QuoteStatus.HALTED
+        assert final["inbound"][-1].intent is Intent.QUESTION_ON_TIMELINE
+        assert EventType.CUSTOMER_REPLIED in deps.events.types()
+        assert deps.channel.freeforms, "contractor was not alerted"
+
+    async def test_unsubscribe_closes_the_quote(self):
+        deps, graph = make(llm=FakeLLM(intent=Intent.UNSUBSCRIBE))
+        inbound = InboundMessage(
+            provider_message_id="wamid.in2", from_customer=True, text="STOP",
+            received_at=datetime.now(timezone.utc),
+        )
+        final = await graph.ainvoke(
+            {"quote_id": "q8", "status": QuoteStatus.ACTIVE, "_entry": Entry.INBOUND,
+             "inbound": [inbound]},
+            cfg("t8"),
+        )
+        assert final["status"] is QuoteStatus.CLOSED
