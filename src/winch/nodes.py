@@ -21,6 +21,7 @@ from winch.protocols import ChannelAdapter, LLMClient, TouchpointQueue
 from winch.scheduler import build_sequence
 from winch.state import (
     ChannelState,
+    ContractorReplyIntent,
     GraphState,
     Intent,
     Quote,
@@ -99,14 +100,25 @@ async def await_contact(state: GraphState, deps: Deps) -> dict:
     if not state.get("_missing"):
         return {"status": QuoteStatus.AWAITING_APPROVAL}
 
+    missing = state.get("_missing", [])
     answer = interrupt({
         "kind": "collect_contact",
-        "missing": state.get("_missing", []),
+        "missing": missing,
         "draft": state["draft"].model_dump() if state.get("draft") else None,
     })
     draft = state["draft"]
     allowed = set(type(draft).model_fields)
     clean = {k: v for k, v in (answer or {}).items() if k in allowed}
+
+    # The contractor answers with the value itself ("07700 900412"), never
+    # with {"customer_phone": "07700 900412"} - nothing upstream produces that
+    # shape. _parse_contractor_reply wraps unrecognised text as {"text": ...},
+    # which the field-name filter above silently drops, discarding the
+    # contractor's answer entirely. When exactly one field was asked for,
+    # plain text unambiguously means "here is that field's value".
+    if not clean and answer and answer.get("text") and len(missing) == 1:
+        clean = {missing[0]: answer["text"].strip()}
+
     await deps.events.write(state["quote_id"], EventType.CONTACT_COLLECTED,
                             {"provided": sorted(clean)})
     merged = draft.model_copy(update=clean) if clean else draft
@@ -127,35 +139,66 @@ async def confirm(state: GraphState, deps: Deps) -> dict:
 
 
 async def await_confirm(state: GraphState, deps: Deps) -> dict:
-    """Interrupt only."""
+    """Interrupt, classifying the reply with an LLM rather than keyword
+    matching, and re-asking when it is genuinely unclear.
+
+    Previously any reply other than the literal string "yes"/"approve"/etc.
+    was treated as an implicit decline - a real, natural reply ("check in
+    now") silently closed the quote outright, with no interrupt payload to
+    notify on and therefore zero feedback to the contractor. Understanding
+    what a contractor meant is exactly the kind of judgment call that belongs
+    to an LLM worker, the same way nodes.triage already classifies customer
+    replies rather than pattern-matching them - deps.llm.classify_contractor_
+    reply is that worker for this decision. classify_contractor_reply is
+    documented to never raise; UNCLEAR is its own failure-safe fallback.
+
+    Looping interrupt() calls within one node is the documented LangGraph
+    pattern for validating human input: each call is resumed independently
+    from the checkpoint, so a prior satisfied call returns instantly on replay
+    and only the newest one actually pauses. No side effects occur before a
+    call, so replay is harmless - consistent with the rest of this file.
+    """
     draft = state["draft"]
-    decision = interrupt({
+    payload = {
         "kind": "confirm_quote",
         "draft": draft.model_dump(),
         "cadence_days": [2, 5, 9],
-    })
+    }
+    while True:
+        decision = interrupt(payload)
 
-    if decision.get("edits"):
-        return {"_decision": decision}
+        if decision.get("edits"):
+            return {"_decision": decision}
 
-    if decision.get("approved") is not True:
-        await deps.events.write(state["quote_id"], EventType.QUOTE_CLOSED,
-                                {"reason": "not_approved"})
-        return {"status": QuoteStatus.CLOSED, "_decision": {}}
+        reply_text = (decision or {}).get("text", "")
+        intent = await deps.llm.classify_contractor_reply(reply_text)
 
-    await deps.events.write(state["quote_id"], EventType.APPROVAL_RECEIVED, {})
-    quote = freeze_quote(Quote(
-        quote_id=state["quote_id"],
-        customer_name=draft.customer_name or "",
-        customer_phone=draft.customer_phone,
-        customer_email=draft.customer_email,
-        project_title=draft.project_title,
-        scope_summary=draft.scope_summary,
-        quote_total=draft.quote_total or 0.0,
-        currency=draft.currency or "GBP",
-        expiry_date=draft.expiry_date,
-    ))
-    return {"quote": quote, "status": QuoteStatus.ACTIVE, "_decision": {}}
+        if intent is ContractorReplyIntent.APPROVED:
+            await deps.events.write(state["quote_id"], EventType.APPROVAL_RECEIVED, {})
+            quote = freeze_quote(Quote(
+                quote_id=state["quote_id"],
+                customer_name=draft.customer_name or "",
+                customer_phone=draft.customer_phone,
+                customer_email=draft.customer_email,
+                project_title=draft.project_title,
+                scope_summary=draft.scope_summary,
+                quote_total=draft.quote_total or 0.0,
+                currency=draft.currency or "GBP",
+                expiry_date=draft.expiry_date,
+            ))
+            return {"quote": quote, "status": QuoteStatus.ACTIVE, "_decision": {}}
+
+        if intent is ContractorReplyIntent.DECLINED:
+            await deps.events.write(state["quote_id"], EventType.QUOTE_CLOSED,
+                                    {"reason": "not_approved"})
+            return {"status": QuoteStatus.CLOSED, "_decision": {}}
+
+        # UNCLEAR - re-ask rather than guessing on the contractor's behalf.
+        payload = {
+            "kind": "confirm_quote_unclear",
+            "draft": draft.model_dump(),
+            "heard": reply_text,
+        }
 
 
 async def apply_edits(state: GraphState, deps: Deps) -> dict:
@@ -217,29 +260,48 @@ async def await_gate(state: GraphState, deps: Deps) -> dict:
     audience will actually tolerate. The demo exists to MEASURE whether the gate
     stalls; relaxing it later is trivial, and observing the honest version fail
     happens once. See docs/DESIGN.md section 4.
+
+    Re-asks on any reply that is not a clear yes or no, for the same reason as
+    await_confirm: treating an unrecognised reply as an implicit HOLD used to
+    silently park the touchpoint with zero feedback telling the contractor
+    their reply was not understood. See await_confirm's docstring for why the
+    interrupt-in-a-loop pattern used here is safe under LangGraph's replay.
     """
     index = state["pending_gate_index"]
     tp = state["touchpoints"][index]
-
-    decision = interrupt({
+    payload = {
         "kind": "approve_send",
         "index": index,
         "template": tp.template_name,
         "preview": tp.body_preview,
-    })
+    }
 
-    approved = decision.get("approved") is True
-    await deps.events.write(
-        state["quote_id"],
-        EventType.GATE_APPROVED if approved else EventType.GATE_HELD,
-        {"index": index},
-    )
-    if not approved:
-        updated = list(state["touchpoints"])
-        updated[index] = tp.model_copy(update={"status": TouchpointStatus.HELD})
-        await deps.queue.mark(state["quote_id"], index, TouchpointStatus.HELD)
-        return {"touchpoints": updated}
-    return {}
+    while True:
+        decision = interrupt(payload)
+        reply_text = (decision or {}).get("text", "")
+        intent = await deps.llm.classify_contractor_reply(reply_text)
+
+        if intent is ContractorReplyIntent.APPROVED:
+            await deps.events.write(state["quote_id"], EventType.GATE_APPROVED,
+                                    {"index": index})
+            return {}
+
+        if intent is ContractorReplyIntent.DECLINED:
+            await deps.events.write(state["quote_id"], EventType.GATE_HELD,
+                                    {"index": index})
+            updated = list(state["touchpoints"])
+            updated[index] = tp.model_copy(update={"status": TouchpointStatus.HELD})
+            await deps.queue.mark(state["quote_id"], index, TouchpointStatus.HELD)
+            return {"touchpoints": updated}
+
+        # UNCLEAR - re-ask rather than silently holding.
+        payload = {
+            "kind": "approve_send_unclear",
+            "index": index,
+            "template": tp.template_name,
+            "preview": tp.body_preview,
+            "heard": reply_text,
+        }
 
 
 async def send(state: GraphState, deps: Deps) -> dict:

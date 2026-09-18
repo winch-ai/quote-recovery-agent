@@ -18,7 +18,7 @@ from winch.events import EventType
 from winch.graph import AWAIT_GATE, Entry, build_graph
 from winch.nodes import Deps
 from winch.protocols import SendResult
-from winch.state import ChannelState, Intent, InboundMessage, QuoteDraft, QuoteStatus
+from winch.state import ChannelState, ContractorReplyIntent, Intent, InboundMessage, QuoteDraft, QuoteStatus
 from winch.supervisor import Node
 
 DRAFT = QuoteDraft(
@@ -44,6 +44,21 @@ class FakeLLM:
 
     async def classify_intent(self, text):
         return self._intent
+
+    async def classify_contractor_reply(self, text):
+        """Deterministic stand-in for the real LLM classifier - matches its
+        CONTRACT (approve/decline/unclear from natural text), not its exact
+        judgment. Real understanding is tested against the actual Azure
+        classifier in test_contractor_reply.py."""
+        import re
+        low = (text or "").strip().lower()
+        tokens = set(re.findall(r"[a-z']+", low))
+        approve_phrases = ("check in now", "go on then", "go for it", "sounds good")
+        if any(p in low for p in approve_phrases) or tokens & {"yes", "yep", "approve", "ok", "start", "send"}:
+            return ContractorReplyIntent.APPROVED
+        if tokens & {"no", "cancel", "hold", "stop"}:
+            return ContractorReplyIntent.DECLINED
+        return ContractorReplyIntent.UNCLEAR
 
     async def compose_reply(self, quote, customer_message):
         return "ok"
@@ -181,6 +196,142 @@ class TestLangGraphGotchas:
         assert deps.events.types().count(EventType.APPROVAL_PROMPT_SENT) == 1
 
 
+class TestFreeTextContactAnswerIsCaptured:
+    """A latent, related bug: when asked for exactly one missing field, a
+    contractor's plain-text reply ("07700 900412") was silently dropped.
+    _parse_contractor_reply wraps unrecognised text as {"text": ...}, and the
+    old merge only kept keys that were literal QuoteDraft field names - "text"
+    is not one, so the answer vanished and the field stayed None with no
+    feedback. Never triggered in practice yet only because every fixture used
+    so far happened to include a phone number.
+    """
+
+    async def test_plain_text_reply_fills_the_single_missing_field(self):
+        deps, graph = make(llm=FakeLLM(draft=DRAFT_NO_PHONE))
+        state = {"quote_id": "qtxt1", "media_id": "m1", "status": QuoteStatus.DRAFT,
+                 "_entry": Entry.INTAKE}
+        result = await graph.ainvoke(state, cfg("ttxt1"))
+        assert result["__interrupt__"][0].value["kind"] == "collect_contact"
+
+        # The contractor just types the number - not {"customer_phone": "..."}.
+        result = await graph.ainvoke(Command(resume={"text": "07700 900412"}), cfg("ttxt1"))
+        assert result["__interrupt__"][0].value["kind"] == "confirm_quote"
+        assert result["__interrupt__"][0].value["draft"]["customer_phone"] == "07700 900412"
+
+        final = await graph.ainvoke(Command(resume={"text": "yes"}), cfg("ttxt1"))
+        assert final["quote"].customer_phone == "07700 900412"
+
+
+class TestContractorReplyIsUnderstoodNotKeywordMatched:
+    """Reproduces a real pilot session, from a screenshot: the contractor
+    swipe-replied to a confirm_quote prompt with the words 'check in now'.
+    The old code matched replies against a literal keyword list
+    ({"yes","approve",...}), so anything else - including this perfectly
+    clear, natural approval - was treated as an implicit decline. The quote
+    was silently closed with no interrupt payload to notify on: the bot went
+    quiet, and the confirmation the contractor thought they'd given never
+    took effect.
+
+    The fix is genuine intent understanding via an LLM worker
+    (deps.llm.classify_contractor_reply), not a longer keyword list. "check in
+    now" must be UNDERSTOOD as approval, not merely fail to crash.
+    """
+
+    async def test_the_exact_reported_phrase_is_understood_as_approval(self):
+        """This is the literal reproduction: it must APPROVE, not merely
+        survive without closing. Genuine understanding, not damage control."""
+        deps, graph = make()
+        state = {"quote_id": "qreal1", "media_id": "m1", "status": QuoteStatus.DRAFT,
+                 "_entry": Entry.INTAKE}
+        await graph.ainvoke(state, cfg("treal1"))
+        final = await graph.ainvoke(Command(resume={"text": "check in now"}), cfg("treal1"))
+
+        assert final["status"] is QuoteStatus.ACTIVE, (
+            "\"check in now\" is a clear approval and must be understood as one"
+        )
+        assert final["quote"].frozen is True
+        assert len(deps.queue.scheduled) == 1
+
+    async def test_a_genuinely_ambiguous_reply_re_asks_rather_than_deciding(self):
+        """Real ambiguity - not a keyword miss - must still not be guessed at.
+        A misrouted reply here either sends nothing to a customer who was
+        promised follow-up, or cancels a quote the contractor never meant to
+        kill."""
+        deps, graph = make()
+        state = {"quote_id": "qreal2", "media_id": "m1", "status": QuoteStatus.DRAFT,
+                 "_entry": Entry.INTAKE}
+        await graph.ainvoke(state, cfg("treal2"))
+        result = await graph.ainvoke(
+            Command(resume={"text": "what does this actually include?"}), cfg("treal2")
+        )
+        assert result.get("status") != QuoteStatus.CLOSED
+        assert result["__interrupt__"][0].value["kind"] == "confirm_quote_unclear"
+
+    async def test_after_a_genuinely_unclear_reply_a_clear_yes_still_works(self):
+        """The conversation must be recoverable - an unclear reply is a
+        re-ask, not a dead end."""
+        deps, graph = make()
+        state = {"quote_id": "qreal3", "media_id": "m1", "status": QuoteStatus.DRAFT,
+                 "_entry": Entry.INTAKE}
+        await graph.ainvoke(state, cfg("treal3"))
+        await graph.ainvoke(Command(resume={"text": "what does this actually include?"}), cfg("treal3"))
+        final = await graph.ainvoke(Command(resume={"text": "yes"}), cfg("treal3"))
+
+        assert final["status"] is QuoteStatus.ACTIVE
+        assert final["quote"].frozen is True
+
+    async def test_an_explicit_decline_still_closes(self):
+        """The fix must not remove the ability to actually decline - only
+        stop mis-hearing a clear reply, and stop guessing on real ambiguity."""
+        deps, graph = make()
+        state = {"quote_id": "qreal4", "media_id": "m1", "status": QuoteStatus.DRAFT,
+                 "_entry": Entry.INTAKE}
+        await graph.ainvoke(state, cfg("treal4"))
+        final = await graph.ainvoke(Command(resume={"text": "no, cancel that one"}), cfg("treal4"))
+        assert final["status"] is QuoteStatus.CLOSED
+
+    async def test_repeated_unclear_replies_keep_re_asking(self):
+        deps, graph = make()
+        state = {"quote_id": "qreal5", "media_id": "m1", "status": QuoteStatus.DRAFT,
+                 "_entry": Entry.INTAKE}
+        await graph.ainvoke(state, cfg("treal5"))
+        r1 = await graph.ainvoke(Command(resume={"text": "what does this actually include?"}), cfg("treal5"))
+        assert r1["__interrupt__"][0].value["kind"] == "confirm_quote_unclear"
+        r2 = await graph.ainvoke(Command(resume={"text": "who is doing the work?"}), cfg("treal5"))
+        assert r2["__interrupt__"][0].value["kind"] == "confirm_quote_unclear"
+        final = await graph.ainvoke(Command(resume={"text": "yes"}), cfg("treal5"))
+        assert final["status"] is QuoteStatus.ACTIVE
+
+    async def test_the_gate_understands_natural_approval_too(self):
+        """Same worker, same fix, at the send gate."""
+        deps, graph = make()
+        state = {"quote_id": "qreal6", "media_id": "m1", "status": QuoteStatus.DRAFT,
+                 "_entry": Entry.INTAKE}
+        await graph.ainvoke(state, cfg("treal6"))
+        await graph.ainvoke(Command(resume={"text": "yes"}), cfg("treal6"))
+        await graph.ainvoke({"_entry": Entry.TICK, "pending_gate_index": 0}, cfg("treal6"))
+
+        final = await graph.ainvoke(Command(resume={"text": "go on then, send it"}), cfg("treal6"))
+        assert len(deps.channel.templates) == 1, "a clear natural approval must actually send"
+
+    async def test_ambiguous_gate_reply_re_asks_instead_of_silently_holding(self):
+        deps, graph = make()
+        state = {"quote_id": "qreal7", "media_id": "m1", "status": QuoteStatus.DRAFT,
+                 "_entry": Entry.INTAKE}
+        await graph.ainvoke(state, cfg("treal7"))
+        await graph.ainvoke(Command(resume={"text": "yes"}), cfg("treal7"))
+        await graph.ainvoke({"_entry": Entry.TICK, "pending_gate_index": 0}, cfg("treal7"))
+
+        result = await graph.ainvoke(
+            Command(resume={"text": "what's it going to say exactly?"}), cfg("treal7")
+        )
+        assert result["__interrupt__"][0].value["kind"] == "approve_send_unclear"
+        assert deps.channel.templates == [], "must not send while the reply is still ambiguous"
+
+        final = await graph.ainvoke(Command(resume={"text": "yes send it"}), cfg("treal7"))
+        assert len(deps.channel.templates) == 1
+
+
 class TestIntakeFlow:
     async def test_a_complete_draft_skips_straight_to_confirm(self):
         """A quote with nothing missing must not pause at collect_contact at
@@ -194,7 +345,7 @@ class TestIntakeFlow:
         result = await graph.ainvoke(state, cfg("t1"))
         assert result["__interrupt__"][0].value["kind"] == "confirm_quote"
 
-        final = await graph.ainvoke(Command(resume={"approved": True}), cfg("t1"))
+        final = await graph.ainvoke(Command(resume={"text": "yes"}), cfg("t1"))
         assert final["status"] is QuoteStatus.ACTIVE
         assert final["quote"].frozen is True
         assert final["quote"].quote_total == 24504.0
@@ -212,7 +363,7 @@ class TestIntakeFlow:
         result = await graph.ainvoke(Command(resume={"customer_phone": "447700900412"}), cfg("t1b"))
         assert result["__interrupt__"][0].value["kind"] == "confirm_quote"
 
-        final = await graph.ainvoke(Command(resume={"approved": True}), cfg("t1b"))
+        final = await graph.ainvoke(Command(resume={"text": "yes"}), cfg("t1b"))
         assert final["quote"].customer_phone == "447700900412"
 
     async def test_declining_closes_without_scheduling(self):
@@ -220,7 +371,7 @@ class TestIntakeFlow:
         state = {"quote_id": "q2", "media_id": "m1", "status": QuoteStatus.DRAFT,
                  "_entry": Entry.INTAKE}
         await graph.ainvoke(state, cfg("t2"))
-        final = await graph.ainvoke(Command(resume={"approved": False}), cfg("t2"))
+        final = await graph.ainvoke(Command(resume={"text": "no"}), cfg("t2"))
         assert final["status"] is QuoteStatus.CLOSED
         assert deps.channel.freeforms == [], (
             "an unsubscribe must not ping the contractor like a normal reply"
@@ -243,7 +394,7 @@ class TestTickFlow:
         state = {"quote_id": qid, "media_id": "m1", "status": QuoteStatus.DRAFT,
                  "_entry": Entry.INTAKE}
         await graph.ainvoke(state, cfg(thread))
-        return await graph.ainvoke(Command(resume={"approved": True}), cfg(thread))
+        return await graph.ainvoke(Command(resume={"text": "yes"}), cfg(thread))
 
     async def test_gate_hold_sends_nothing(self):
         """A held touchpoint must produce zero outbound messages."""
@@ -252,7 +403,7 @@ class TestTickFlow:
         await graph.ainvoke(
             {"_entry": Entry.TICK, "pending_gate_index": 0}, cfg("t4")
         )
-        final = await graph.ainvoke(Command(resume={"approved": False}), cfg("t4"))
+        final = await graph.ainvoke(Command(resume={"text": "no"}), cfg("t4"))
         assert deps.channel.templates == [], "a held gate still sent a message"
         assert EventType.GATE_HELD in deps.events.types()
         assert EventType.TOUCHPOINT_SENT not in deps.events.types()
@@ -261,7 +412,7 @@ class TestTickFlow:
         deps, graph = make()
         await self._approved_quote(graph, "t5", "q5")
         await graph.ainvoke({"_entry": Entry.TICK, "pending_gate_index": 0}, cfg("t5"))
-        await graph.ainvoke(Command(resume={"approved": True}), cfg("t5"))
+        await graph.ainvoke(Command(resume={"text": "yes"}), cfg("t5"))
         assert len(deps.channel.templates) == 1
         to, template, variables = deps.channel.templates[0]
         assert to == "447700900412"
@@ -275,7 +426,7 @@ class TestTickFlow:
         deps, graph = make(channel=channel)
         await self._approved_quote(graph, "t6", "q6")
         await graph.ainvoke({"_entry": Entry.TICK, "pending_gate_index": 0}, cfg("t6"))
-        final = await graph.ainvoke(Command(resume={"approved": True}), cfg("t6"))
+        final = await graph.ainvoke(Command(resume={"text": "yes"}), cfg("t6"))
         assert final["channel"] is ChannelState.WHATSAPP_UNREACHABLE
         assert EventType.CHANNEL_UNAVAILABLE in deps.events.types()
         assert EventType.RELAYED_TO_CONTRACTOR in deps.events.types()

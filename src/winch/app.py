@@ -227,7 +227,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
 
 async def _handle(runtime: Runtime, settings: Settings, event: ParsedEvent) -> None:
-    """Translate one Meta event into a graph invocation."""
+    """Translate one Meta event into a graph invocation.
+
+    Any unhandled failure below is caught, logged in full, reported to the
+    contractor as a plain "something went wrong" message, and then re-raised
+    so webhook.py's own handler still releases the dedup lock for Meta's
+    redelivery. Previously an exception here was silently swallowed one layer
+    up with no message to the contractor at all - from their side that is
+    indistinguishable from the product simply not working, which for an
+    already-fatigued user is worse than an honest "I hit a snag."
+    """
     if event.kind == "status":
         return
 
@@ -240,6 +249,32 @@ async def _handle(runtime: Runtime, settings: Settings, event: ParsedEvent) -> N
         except Exception:
             logger.exception("failed to record inbound contact for %s", event.from_wa_id)
 
+    try:
+        await _route_event(runtime, settings, event)
+    except Exception:
+        logger.exception("unhandled error processing message %s", event.provider_message_id)
+        await _tell_contractor_something_went_wrong(runtime, settings)
+        raise
+
+
+async def _tell_contractor_something_went_wrong(runtime: Runtime, settings: Settings) -> None:
+    """Best-effort - a failure here must not itself raise and mask the
+    original error, but it must be attempted regardless of which part of
+    processing failed. v1 has exactly one contractor, so there is no routing
+    ambiguity about who to tell."""
+    try:
+        await runtime.contractor_channel.send_freeform(
+            settings.contractor_wa_id,
+            "Something went wrong on my end handling that - I've logged it "
+            "and it'll get looked at. Sorry for the hiccup, try again in a bit.",
+        )
+    except Exception:
+        logger.exception("also failed to notify the contractor of the earlier failure")
+
+
+async def _route_event(runtime: Runtime, settings: Settings, event: ParsedEvent) -> None:
+    """The actual routing logic, split out so _handle can wrap it in one
+    failure-reporting try/except without a second level of indentation."""
     from_contractor = event.from_wa_id == settings.contractor_wa_id
     logger.info(
         "routing: kind=%s from_matches_contractor=%s has_media=%s has_text=%s has_button=%s",
@@ -366,6 +401,28 @@ def _render_interrupt(payload: dict) -> str:
         ]
         return "\n".join(lines)
 
+    if kind == "confirm_quote_unclear":
+        draft = payload.get("draft") or {}
+        customer = draft.get("customer_name") or "the customer"
+        heard = payload.get("heard") or ""
+        lines = [
+            f"Sorry, didn't quite catch that for {customer}'s quote"
+            + (f' (I saw: "{heard}").' if heard else "."),
+            "Reply YES to start the follow-ups, or NO to cancel this one.",
+            SWIPE_HINT,
+        ]
+        return "\n".join(lines)
+
+    if kind == "approve_send_unclear":
+        heard = payload.get("heard") or ""
+        lines = [
+            f"Didn't catch that for the {payload.get('template')} message"
+            + (f' (I saw: "{heard}").' if heard else "."),
+            "Reply YES to send it, or HOLD to skip this one for now.",
+            SWIPE_HINT,
+        ]
+        return "\n".join(lines)
+
     return f"Waiting on you: {kind}"
 
 
@@ -410,13 +467,18 @@ async def _sync_thread_index(runtime: Runtime, thread: str) -> None:
 
 
 def _parse_contractor_reply(event: ParsedEvent) -> dict:
-    """Map a button tap or a plain reply onto a resume payload."""
-    payload = (event.button_payload or event.text or "").strip().lower()
-    if payload in {"yes", "approve", "send", "ok", "start", "1"}:
-        return {"approved": True}
-    if payload in {"no", "hold", "stop", "cancel", "0"}:
-        return {"approved": False}
-    return {"text": event.text or ""}
+    """Pass the contractor's raw reply through to the graph.
+
+    Pure plumbing - no interpretation happens here. Understanding whether a
+    reply means yes, no, or something else is genuine language understanding,
+    which belongs to the LLM worker inside the node that asked the question
+    (nodes.await_confirm / nodes.await_gate call deps.llm.classify_contractor_
+    reply), not to a keyword list at the transport boundary. Keyword matching
+    here previously meant that anything other than an exact "yes"/"approve"/
+    etc. string was silently treated as a decline - a natural reply like
+    "check in now" closed the quote outright with zero feedback.
+    """
+    return {"text": event.button_payload or event.text or ""}
 
 
 async def _pending_thread(runtime: Runtime, wa_id: str,
@@ -524,6 +586,7 @@ def _internal_router(runtime: Runtime, settings: Settings) -> APIRouter:
             except Exception:
                 logger.exception("tick failed for %s/%s", due.quote_id,
                                  due.touchpoint_index)
+                await _tell_contractor_something_went_wrong(runtime, settings)
         return {"claimed": len(claimed)}
 
     return router

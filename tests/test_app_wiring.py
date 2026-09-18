@@ -21,16 +21,27 @@ def ev(text=None, button=None):
 
 
 class TestContractorReplyParsing:
-    @pytest.mark.parametrize("word", ["yes", "YES", "approve", "send", "ok", "start", "1", " Ok "])
-    def test_affirmatives_approve(self, word):
-        assert _parse_contractor_reply(ev(text=word)) == {"approved": True}
+    """_parse_contractor_reply is pure plumbing: it passes the contractor's
+    raw text through unchanged and interprets nothing. Interpretation - what
+    did they mean by "yes", or "check in now", or "no thanks" - is genuine
+    language understanding and belongs to the LLM worker inside the node that
+    asked the question (nodes.await_confirm / nodes.await_gate call
+    deps.llm.classify_contractor_reply), not to a keyword list at the
+    transport boundary. Keyword matching here was the actual production
+    defect: anything other than an exact "yes"/"approve"/etc. string was
+    silently treated as a decline.
+    """
 
-    @pytest.mark.parametrize("word", ["no", "NO", "hold", "stop", "cancel", "0"])
-    def test_negatives_hold(self, word):
-        assert _parse_contractor_reply(ev(text=word)) == {"approved": False}
+    def test_text_passes_through_unchanged(self):
+        assert _parse_contractor_reply(ev(text="check in now")) == {"text": "check in now"}
+
+    def test_an_exact_keyword_also_just_passes_through(self):
+        """No special-casing for "yes" either - it goes through the same
+        classifier as everything else."""
+        assert _parse_contractor_reply(ev(text="yes")) == {"text": "yes"}
 
     def test_button_payload_takes_precedence_over_text(self):
-        assert _parse_contractor_reply(ev(text="whatever", button="yes")) == {"approved": True}
+        assert _parse_contractor_reply(ev(text="whatever", button="yes")) == {"text": "yes"}
 
     def test_free_text_becomes_a_text_payload(self):
         out = _parse_contractor_reply(ev(text="the number is 07700 900412"))
@@ -696,3 +707,201 @@ class TestPendingThreadDisambiguation:
         runtime.threads = FakeThreads()
         result = await _pending_thread(runtime, "44770", "wamid.unrelated")
         assert result == "q_fallback"
+
+
+class TestUnclearReplyRendering:
+    """The re-ask prompts for the two ambiguous-reply gates."""
+
+    def test_confirm_quote_unclear_names_the_customer_and_offers_yes_no(self):
+        from winch.app import _render_interrupt
+
+        text = _render_interrupt({
+            "kind": "confirm_quote_unclear",
+            "draft": {"customer_name": "Mark Henderson"},
+            "heard": "check in now",
+        })
+        assert "Mark Henderson" in text
+        assert "check in now" in text
+        assert "YES" in text and "NO" in text
+
+    def test_confirm_quote_unclear_degrades_gracefully_with_no_heard_text(self):
+        from winch.app import _render_interrupt
+
+        text = _render_interrupt({"kind": "confirm_quote_unclear", "draft": {}})
+        assert "YES" in text
+
+    def test_approve_send_unclear_names_the_template(self):
+        from winch.app import _render_interrupt
+
+        text = _render_interrupt({
+            "kind": "approve_send_unclear", "template": "checkin_soft",
+            "heard": "go on then",
+        })
+        assert "checkin_soft" in text
+        assert "go on then" in text
+        assert "YES" in text and "HOLD" in text
+
+
+class TestErrorVisibilitySafetyNet:
+    """A failure during message processing must never be pure silence to the
+    contractor - it was previously swallowed one layer up (webhook.py's
+    per-event catch) with nothing sent to WhatsApp, indistinguishable from the
+    product simply not working. Every unhandled exception must now produce a
+    plain apology message before the exception is re-raised (so webhook.py's
+    dedup-release behaviour for Meta's redelivery is unaffected).
+    """
+
+    def _runtime_and_settings(self, monkeypatch):
+        for k, v in {
+            "AZURE_OPENAI_ENDPOINT": "https://e.openai.azure.com",
+            "AZURE_OPENAI_API_KEY": "k", "LLM_MODEL": "azure_openai:m",
+            "CONTRACTOR_WA_ID": "447700900555",
+        }.items():
+            monkeypatch.setenv(k, v)
+        from winch.app import Runtime
+        from winch.config import Settings
+        settings = Settings.from_env()
+        return Runtime(settings), settings
+
+    async def test_an_unhandled_exception_notifies_the_contractor(self, monkeypatch):
+        from winch.app import _handle
+        from winch.webhook import ParsedEvent
+        from datetime import datetime, timezone
+
+        runtime, settings = self._runtime_and_settings(monkeypatch)
+        sent = []
+
+        class FakeContractorChannel:
+            async def send_freeform(self, to, body):
+                sent.append((to, body))
+
+        class FakeContactWindow:
+            async def record_inbound(self, wa_id):
+                pass
+
+        class BrokenThreads:
+            async def resolve_reply(self, reply_to_message_id):
+                return None
+
+            async def pending_thread(self):
+                raise RuntimeError("db exploded")
+
+        runtime.contractor_channel = FakeContractorChannel()
+        runtime.contact_window = FakeContactWindow()
+        runtime.threads = BrokenThreads()
+
+        event = ParsedEvent(kind="message", provider_message_id="wamid.err1",
+                           from_wa_id="447700900555", text="yes",
+                           timestamp=datetime.now(timezone.utc))
+
+        with pytest.raises(RuntimeError):
+            await _handle(runtime, settings, event)
+
+        assert len(sent) == 1
+        assert sent[0][0] == "447700900555"
+        assert "went wrong" in sent[0][1].lower()
+
+    async def test_the_exception_is_still_re_raised_after_notifying(self, monkeypatch):
+        """webhook.py's own handler depends on the exception propagating, so
+        it can release the dedup lock for Meta's redelivery."""
+        from winch.app import _handle
+        from winch.webhook import ParsedEvent
+        from datetime import datetime, timezone
+
+        runtime, settings = self._runtime_and_settings(monkeypatch)
+
+        class FakeContractorChannel:
+            async def send_freeform(self, to, body):
+                pass
+
+        class FakeContactWindow:
+            async def record_inbound(self, wa_id):
+                pass
+
+        class BrokenThreads:
+            async def resolve_reply(self, reply_to_message_id):
+                return None
+
+            async def pending_thread(self):
+                raise ValueError("specific failure")
+
+        runtime.contractor_channel = FakeContractorChannel()
+        runtime.contact_window = FakeContactWindow()
+        runtime.threads = BrokenThreads()
+
+        event = ParsedEvent(kind="message", provider_message_id="wamid.err2",
+                           from_wa_id="447700900555", text="yes",
+                           timestamp=datetime.now(timezone.utc))
+
+        with pytest.raises(ValueError, match="specific failure"):
+            await _handle(runtime, settings, event)
+
+    async def test_a_second_failure_while_notifying_does_not_mask_the_first(self, monkeypatch):
+        """If even the apology message fails to send, that must not swallow
+        or replace the original exception - the real error still propagates
+        and gets logged."""
+        from winch.app import _handle
+        from winch.webhook import ParsedEvent
+        from datetime import datetime, timezone
+
+        runtime, settings = self._runtime_and_settings(monkeypatch)
+
+        class DoublyBrokenChannel:
+            async def send_freeform(self, to, body):
+                raise ConnectionError("also broken")
+
+        class FakeContactWindow:
+            async def record_inbound(self, wa_id):
+                pass
+
+        class BrokenThreads:
+            async def resolve_reply(self, reply_to_message_id):
+                return None
+
+            async def pending_thread(self):
+                raise RuntimeError("the real error")
+
+        runtime.contractor_channel = DoublyBrokenChannel()
+        runtime.contact_window = FakeContactWindow()
+        runtime.threads = BrokenThreads()
+
+        event = ParsedEvent(kind="message", provider_message_id="wamid.err3",
+                           from_wa_id="447700900555", text="yes",
+                           timestamp=datetime.now(timezone.utc))
+
+        with pytest.raises(RuntimeError, match="the real error"):
+            await _handle(runtime, settings, event)
+
+    async def test_success_path_sends_no_apology(self, monkeypatch):
+        """The safety net must not fire on the happy path."""
+        from winch.app import _handle
+        from winch.webhook import ParsedEvent
+        from datetime import datetime, timezone
+
+        runtime, settings = self._runtime_and_settings(monkeypatch)
+        sent = []
+
+        class FakeContractorChannel:
+            async def send_freeform(self, to, body):
+                sent.append((to, body))
+
+        class FakeContactWindow:
+            async def record_inbound(self, wa_id):
+                pass
+
+        class FakeThreads:
+            async def resolve_reply(self, reply_to_message_id):
+                return None
+
+            async def pending_thread(self):
+                return None  # "no pending interrupt; ignoring" - a normal outcome
+
+        runtime.contractor_channel = FakeContractorChannel()
+        runtime.contact_window = FakeContactWindow()
+        runtime.threads = FakeThreads()
+
+        event = ParsedEvent(kind="message", provider_message_id="wamid.ok1",
+                           from_wa_id="447700900555", text="random chatter",
+                           timestamp=datetime.now(timezone.utc))
+        await _handle(runtime, settings, event)
+        assert sent == []

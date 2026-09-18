@@ -51,6 +51,22 @@ class Intent(StrEnum):
     UNCLEAR = "UNCLEAR"
 
 
+class ContractorReplyIntent(StrEnum):
+    """What the contractor meant by a reply to a confirm/gate prompt.
+
+    A separate enum from Intent, which describes a CUSTOMER's reaction to a
+    quote follow-up - a genuinely different concept. Classified by an LLM
+    (see LLMClient.classify_contractor_reply), the same way nodes.triage
+    already classifies customer replies - literal keyword matching
+    ("yes"/"approve"/"ok") was the actual defect that let a real reply
+    ("check in now") fall through as an implicit decline with zero feedback.
+    """
+
+    APPROVED = "APPROVED"
+    DECLINED = "DECLINED"
+    UNCLEAR = "UNCLEAR"
+
+
 class QuoteDraft(BaseModel):
     """Strict extraction target. The ONLY schema the Extractor may emit.
 

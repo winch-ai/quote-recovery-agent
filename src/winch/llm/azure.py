@@ -199,7 +199,7 @@ class AzureExtractor:
         return draft
 
 
-from winch.state import Intent, Quote
+from winch.state import ContractorReplyIntent, Intent, Quote
 
 CLASSIFIER_SYSTEM_PROMPT = """You classify a customer's reply to a trade quote follow-up. Return one intent.
 
@@ -214,6 +214,21 @@ UNCLEAR - anything else, or you are not confident.
 
 Prefer UNCLEAR over a wrong guess. A misrouted reply is worse than an
 unclassified one, because the contractor reads every unclassified reply anyway."""
+
+CONTRACTOR_REPLY_CLASSIFIER_SYSTEM_PROMPT = """You classify a contractor's reply to a WhatsApp prompt asking them to
+approve or decline something (start a follow-up sequence, or send a message).
+Return one intent.
+
+APPROVED - they agree, want to proceed, or confirm - in any phrasing. Examples:
+  "yes", "yep", "go for it", "sounds good", "check in now", "do it", "start it".
+DECLINED - they say no, want to stop, cancel, or hold this one - in any
+  phrasing. Examples: "no", "not yet", "hold off", "cancel that", "stop".
+UNCLEAR - anything else: a question, a correction, small talk, or you are not
+  confident which of the above they meant.
+
+Prefer UNCLEAR over a wrong guess. Silently guessing wrong here is worse than
+asking again, because the wrong guess either sends something to a customer
+without real approval, or cancels a quote the contractor never meant to kill."""
 
 COMPOSE_REPLY_SYSTEM_PROMPT = (
     "You draft a short, plain reply to a customer in the contractor's voice.\n\n"
@@ -237,6 +252,27 @@ def _build_classifier_response_format() -> dict[str, Any]:
                     "intent": {
                         "type": "string",
                         "enum": [i.value for i in Intent],
+                    },
+                },
+                "required": ["intent"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def _build_contractor_reply_response_format() -> dict[str, Any]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "contractor_reply_classification",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "intent": {
+                        "type": "string",
+                        "enum": [i.value for i in ContractorReplyIntent],
                     },
                 },
                 "required": ["intent"],
@@ -361,6 +397,41 @@ class AzureTextClient:
             return Intent(intent_val)
         except Exception:
             return Intent.UNCLEAR
+
+    async def classify_contractor_reply(self, text: str) -> ContractorReplyIntent:
+        """Mirrors classify_intent exactly - same defensive shape, different
+        enum and prompt. UNCLEAR on any failure so await_confirm/await_gate
+        re-ask instead of the caller ever seeing an exception."""
+        try:
+            url = self._build_url()
+            headers = {
+                "Content-Type": "application/json",
+                "api-key": self.api_key,
+            }
+            body = {
+                "messages": [
+                    {"role": "system", "content": CONTRACTOR_REPLY_CLASSIFIER_SYSTEM_PROMPT},
+                    {"role": "user", "content": text},
+                ],
+                "response_format": _build_contractor_reply_response_format(),
+                "max_completion_tokens": 50,
+            }
+
+            if self.http_client is not None:
+                response = await self._send_with_retries(self.http_client, url, headers, body)
+            else:
+                async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+                    response = await self._send_with_retries(client, url, headers, body)
+
+            data = response.json()
+            raw_content = data["choices"][0]["message"]["content"]
+            if raw_content is None:
+                return ContractorReplyIntent.UNCLEAR
+            parsed = json.loads(raw_content)
+            intent_val = parsed.get("intent")
+            return ContractorReplyIntent(intent_val)
+        except Exception:
+            return ContractorReplyIntent.UNCLEAR
 
     async def compose_reply(self, quote: Quote, customer_message: str) -> str:
         url = self._build_url()

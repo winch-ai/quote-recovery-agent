@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 from datetime import datetime
 
-from winch.state import Intent, Quote, QuoteDraft, Touchpoint, TouchpointStatus
+from winch.state import ContractorReplyIntent, Intent, Quote, QuoteDraft, Touchpoint, TouchpointStatus
 
 
 class SendResult(BaseModel):
@@ -101,6 +101,17 @@ class LLMClient(Protocol):
     async def extract_quote(self, media: bytes, mime_type: str) -> QuoteDraft: ...
 
     async def classify_intent(self, text: str) -> Intent: ...
+
+    async def classify_contractor_reply(self, text: str) -> ContractorReplyIntent:
+        """What did the contractor mean by this reply to a confirm/gate prompt?
+
+        Genuine language understanding, not keyword matching - "check in now",
+        "yep go for it", and "sounds good" must all classify as APPROVED, the
+        same way classify_intent already understands a customer's phrasing
+        rather than matching a fixed word list. MUST NOT raise; return UNCLEAR
+        on any failure so the caller re-asks instead of crashing.
+        """
+        ...
 
     async def compose_reply(self, quote: Quote, customer_message: str) -> str:
         """Draft a free-form reply. Only legal inside an open 24-hour window.
