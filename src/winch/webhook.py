@@ -29,8 +29,13 @@ class InMemoryDeduplicator:
         self._seen: collections.OrderedDict[str, None] = collections.OrderedDict()
         self._lock = asyncio.Lock()
 
+    async def release(self, provider_message_id: str) -> None:
+        """Un-claim a failed id so Meta's redelivery gets another attempt."""
+        async with self._lock:
+            self._seen.pop(provider_message_id, None)
+
     async def seen(self, provider_message_id: str) -> bool:
-        """Record the id. Return True if it had already been recorded."""
+        """Claim the id. Return True if it had already been claimed."""
         async with self._lock:
             if provider_message_id in self._seen:
                 return True
@@ -385,6 +390,16 @@ def build_router(
                     event.provider_message_id,
                     type(exc).__name__,
                 )
+                # Un-claim so Meta's redelivery retries rather than being
+                # dropped as a duplicate. Losing a forwarded quote is worse
+                # than handling one twice.
+                try:
+                    await deduplicator.release(event.provider_message_id)
+                except Exception:
+                    logger.exception(
+                        "failed to release %s; event will be lost on redelivery",
+                        event.provider_message_id,
+                    )
 
         return Response(content="OK", status_code=200)
 

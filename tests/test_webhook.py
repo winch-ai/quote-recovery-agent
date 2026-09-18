@@ -746,3 +746,47 @@ async def test_no_secret_or_token_or_signature_in_logs(caplog: pytest.LogCapture
     assert fake_sig not in webhook_log_text
     assert valid_sig not in webhook_log_text
     assert valid_sig[7:] not in webhook_log_text
+
+
+# --- added by Claude during audit: at-least-once delivery ---
+
+def _ev(mid: str) -> ParsedEvent:
+    return ParsedEvent(kind="message", provider_message_id=mid,
+                       from_wa_id="447700900412", text="hi",
+                       timestamp=datetime(2026, 9, 18, tzinfo=timezone.utc))
+
+
+@pytest.mark.asyncio
+async def test_failed_handler_releases_the_id_so_redelivery_retries():
+    """A handler that raises must not consume the event permanently.
+
+    Meta redelivers on failure. If the id stays claimed, the redelivery is
+    dropped as a duplicate and a contractor's forwarded quote vanishes. This
+    is the at-most-once vs at-least-once decision, and it must be the latter.
+    """
+    dedup = InMemoryDeduplicator()
+    calls = []
+
+    async def failing_handler(event):
+        calls.append(event.provider_message_id)
+        raise RuntimeError("downstream exploded")
+
+    assert await dedup.seen("wamid.RETRY") is False
+    try:
+        await failing_handler(_ev("wamid.RETRY"))
+    except RuntimeError:
+        await dedup.release("wamid.RETRY")
+
+    # redelivery must be treated as new, not as a duplicate
+    assert await dedup.seen("wamid.RETRY") is False
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_release_is_idempotent():
+    dedup = InMemoryDeduplicator()
+    await dedup.release("never-claimed")
+    await dedup.seen("x")
+    await dedup.release("x")
+    await dedup.release("x")
+    assert await dedup.seen("x") is False

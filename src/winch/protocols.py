@@ -44,7 +44,17 @@ class MessageDeduplicator(Protocol):
     """
 
     async def seen(self, provider_message_id: str) -> bool:
-        """Record the id. Return True if it had already been recorded."""
+        """Claim the id. Return True if it had already been claimed."""
+        ...
+
+    async def release(self, provider_message_id: str) -> None:
+        """Un-claim an id whose handler failed, so redelivery can retry it.
+
+        Without this, a handler that raises loses the event permanently: Meta
+        redelivers, the id is already claimed, and we silently drop it. The
+        send path has its own idempotency guard, so retrying is the safer
+        failure mode than losing a contractor's quote.
+        """
         ...
 
 
