@@ -190,6 +190,51 @@ class PostgresEventSink:
                 )
 
 
+class PostgresContactWindow:
+    """Tracks the last time each WhatsApp number messaged us.
+
+    This exists separately from the events table because window-openness is a
+    delivery-layer fact ("did this number message us in the last 24h"), not a
+    business-layer one. The original check queried event_type='customer_replied',
+    which is only ever written for end customers (see nodes.triage) - so the
+    contractor's own window was structurally always closed, and every attempt
+    to notify the contractor via send_freeform was silently refused.
+
+    record_inbound() must be called for EVERY inbound message, contractor or
+    customer, the moment it is received - not just ones that reach the graph.
+    """
+
+    def __init__(self, pool: AsyncConnectionPool) -> None:
+        self._pool = pool
+
+    async def record_inbound(self, wa_id: str) -> None:
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO inbound_contacts (wa_id, last_seen_at)
+                    VALUES (%s, now())
+                    ON CONFLICT (wa_id) DO UPDATE
+                    SET last_seen_at = now();
+                    """,
+                    (wa_id,),
+                )
+
+    async def is_open(self, wa_id: str) -> bool:
+        """True if wa_id messaged us within the last 24 hours."""
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT 1 FROM inbound_contacts
+                    WHERE wa_id = %s AND last_seen_at > now() - interval \'24 hours\'
+                    LIMIT 1;
+                    """,
+                    (wa_id,),
+                )
+                return await cur.fetchone() is not None
+
+
 class PostgresThreadIndex:
     """Postgres-backed index mapping WhatsApp contacts and interrupts to threads."""
 

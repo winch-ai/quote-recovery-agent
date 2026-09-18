@@ -26,6 +26,7 @@ from winch.legal import build_router as build_legal_router
 from winch.llm.azure import AzureExtractor, AzureTextClient
 from winch.nodes import Deps, new_quote_id
 from winch.repository import (
+    PostgresContactWindow,
     PostgresDeduplicator,
     PostgresEventSink,
     PostgresThreadIndex,
@@ -82,6 +83,7 @@ class Runtime:
         self.events = PostgresEventSink(self.pool)
         self.deduplicator = PostgresDeduplicator(self.pool)
         self.threads = PostgresThreadIndex(self.pool)
+        self.contact_window = PostgresContactWindow(self.pool)
 
         channel = WhatsAppChannel(
             phone_number_id=s.meta_phone_number_id,
@@ -129,19 +131,18 @@ class Runtime:
     async def _window_open(self, to: str) -> bool:
         """A 24-hour window is open only if that number messaged us recently.
 
+        Delegates to PostgresContactWindow, which tracks inbound timestamps
+        directly rather than inferring them from business event types. The
+        original version queried event_type='customer_replied', which is only
+        ever written for end customers - so it always reported the
+        contractor's own window as closed, and every contractor notification
+        was silently refused by send_freeform's fail-closed check.
+
         Fails closed: any error means 'not open', so a failure can never cause
         an out-of-window free-form send.
         """
         try:
-            async with self.pool.connection() as conn:
-                cur = await conn.execute(
-                    """SELECT 1 FROM events
-                       WHERE event_type = 'customer_replied'
-                         AND payload->>'from' = %s
-                         AND at > now() - interval '24 hours' LIMIT 1""",
-                    (to,),
-                )
-                return await cur.fetchone() is not None
+            return await self.contact_window.is_open(to)
         except Exception:
             logger.exception("window check failed for a recipient; failing closed")
             return False
@@ -229,6 +230,15 @@ async def _handle(runtime: Runtime, settings: Settings, event: ParsedEvent) -> N
     """Translate one Meta event into a graph invocation."""
     if event.kind == "status":
         return
+
+    # Record inbound BEFORE any routing decision. The 24h window opens the
+    # moment a number messages us, unconditionally - it must not depend on
+    # whether the message goes on to parse, route or reach the graph at all.
+    if event.from_wa_id:
+        try:
+            await runtime.contact_window.record_inbound(event.from_wa_id)
+        except Exception:
+            logger.exception("failed to record inbound contact for %s", event.from_wa_id)
 
     from_contractor = event.from_wa_id == settings.contractor_wa_id
     logger.info(

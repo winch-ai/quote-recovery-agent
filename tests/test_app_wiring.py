@@ -193,6 +193,134 @@ class TestDataDeletionPage:
         assert "30 days" in self._client().get("/data-deletion").text
 
 
+class TestWindowOpenDelegatesCorrectly:
+    """The real production bug: _window_open queried event_type=customer_replied,
+    an event that is only ever written for end customers, so the contractor's
+    own free-form notifications were always silently refused. It now delegates
+    to Runtime.contact_window, which is a plain per-number timestamp."""
+
+    def _runtime(self, monkeypatch):
+        for k, v in {
+            "AZURE_OPENAI_ENDPOINT": "https://e.openai.azure.com",
+            "AZURE_OPENAI_API_KEY": "k", "LLM_MODEL": "azure_openai:m",
+        }.items():
+            monkeypatch.setenv(k, v)
+        from winch.app import Runtime
+        from winch.config import Settings
+        return Runtime(Settings.from_env())
+
+    async def test_delegates_to_contact_window(self, monkeypatch):
+        runtime = self._runtime(monkeypatch)
+
+        class FakeWindow:
+            async def is_open(self, wa_id):
+                return wa_id == "447700900001"
+
+        runtime.contact_window = FakeWindow()
+        assert await runtime._window_open("447700900001") is True
+        assert await runtime._window_open("447700900002") is False
+
+    async def test_an_exception_fails_closed(self, monkeypatch):
+        runtime = self._runtime(monkeypatch)
+
+        class BrokenWindow:
+            async def is_open(self, wa_id):
+                raise RuntimeError("db down")
+
+        runtime.contact_window = BrokenWindow()
+        assert await runtime._window_open("447700900001") is False
+
+
+class TestInboundIsRecordedBeforeRouting:
+    """record_inbound must fire unconditionally, before any routing decision -
+    the window opens on receipt regardless of what the message goes on to do,
+    including messages that get ignored entirely."""
+
+    def _runtime_and_settings(self, monkeypatch):
+        for k, v in {
+            "AZURE_OPENAI_ENDPOINT": "https://e.openai.azure.com",
+            "AZURE_OPENAI_API_KEY": "k", "LLM_MODEL": "azure_openai:m",
+            "CONTRACTOR_WA_ID": "447700900555",
+        }.items():
+            monkeypatch.setenv(k, v)
+        from winch.app import Runtime
+        from winch.config import Settings
+        settings = Settings.from_env()
+        return Runtime(settings), settings
+
+    async def test_status_events_do_not_record_inbound(self, monkeypatch):
+        """Status callbacks (delivered/read) are not messages from a number
+        and must not be treated as one opening a window."""
+        from winch.app import _handle
+        from winch.webhook import ParsedEvent
+        from datetime import datetime, timezone
+
+        runtime, settings = self._runtime_and_settings(monkeypatch)
+        recorded = []
+
+        class FakeWindow:
+            async def record_inbound(self, wa_id):
+                recorded.append(wa_id)
+
+        runtime.contact_window = FakeWindow()
+        event = ParsedEvent(kind="status", provider_message_id="wamid.s1",
+                           status="delivered", timestamp=datetime.now(timezone.utc))
+        await _handle(runtime, settings, event)
+        assert recorded == []
+
+    async def test_unknown_customer_message_still_records_inbound(self, monkeypatch):
+        """Even a message from a number we do not recognise and end up
+        ignoring must still open that number's window - the record happens
+        before the 'unknown number' routing decision is made."""
+        from winch.app import _handle
+        from winch.webhook import ParsedEvent
+        from datetime import datetime, timezone
+
+        runtime, settings = self._runtime_and_settings(monkeypatch)
+        recorded = []
+
+        class FakeWindow:
+            async def record_inbound(self, wa_id):
+                recorded.append(wa_id)
+
+        class FakeThreads:
+            async def thread_for_customer(self, wa_id):
+                return None
+
+        runtime.contact_window = FakeWindow()
+        runtime.threads = FakeThreads()
+        event = ParsedEvent(kind="message", provider_message_id="wamid.u1",
+                           from_wa_id="447700900099", text="hello",
+                           timestamp=datetime.now(timezone.utc))
+        await _handle(runtime, settings, event)
+        assert recorded == ["447700900099"]
+
+    async def test_a_failure_recording_inbound_does_not_block_processing(self, monkeypatch):
+        """record_inbound is best-effort - a DB hiccup here must not stop the
+        rest of the message from being processed."""
+        from winch.app import _handle
+        from winch.webhook import ParsedEvent
+        from datetime import datetime, timezone
+
+        runtime, settings = self._runtime_and_settings(monkeypatch)
+
+        class BrokenWindow:
+            async def record_inbound(self, wa_id):
+                raise RuntimeError("db down")
+
+        class FakeThreads:
+            async def thread_for_customer(self, wa_id):
+                return None
+
+        runtime.contact_window = BrokenWindow()
+        runtime.threads = FakeThreads()
+        event = ParsedEvent(kind="message", provider_message_id="wamid.u2",
+                           from_wa_id="447700900099", text="hello",
+                           timestamp=datetime.now(timezone.utc))
+        # must not raise
+        await _handle(runtime, settings, event)
+
+
 class TestLazyWiring:
     """Collaborators are built in Runtime.start(), which runs in the lifespan
     hook - after create_app() has wired the router. Anything captured by value

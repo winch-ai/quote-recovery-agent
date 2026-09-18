@@ -32,6 +32,11 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS idx_events_quote_id_at ON events (quote_id, at);
 
+CREATE TABLE IF NOT EXISTS inbound_contacts (
+    wa_id text PRIMARY KEY,
+    last_seen_at timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS quote_threads (
     quote_id text PRIMARY KEY,
     customer_wa_id text,
