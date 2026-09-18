@@ -36,6 +36,24 @@ from winch.webhook import ParsedEvent, build_router
 logger = logging.getLogger(__name__)
 
 
+def configure_logging(level: str | None = None) -> None:
+    """Emit application logs.
+
+    Python's root logger defaults to WARNING, so every logger.info() in this
+    package was discarded - including the intake path and the webhook
+    diagnostics. Uvicorn configures its own loggers, which is why access lines
+    appeared while application lines did not, and why several real failures
+    looked like silence.
+    """
+    resolved = (level or os.environ.get("LOG_LEVEL") or "INFO").upper()
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+    root = logging.getLogger()
+    root.handlers = [handler]
+    root.setLevel(resolved)
+    logging.getLogger("winch").setLevel(resolved)
+
+
 class Runtime:
     """Everything built once at boot and reused per request."""
 
@@ -169,6 +187,7 @@ class _CombinedLLM:
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
+    configure_logging()
     settings = settings or Settings.from_env()
     runtime = Runtime(settings)
 

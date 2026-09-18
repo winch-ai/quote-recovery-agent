@@ -228,3 +228,41 @@ class TestLazyWiring:
         lazy = _LazyDeduplicator(self._runtime(monkeypatch))
         with pytest.raises(RuntimeError, match="Runtime.start"):
             await lazy.seen("wamid.1")
+
+
+class TestLogging:
+    """Application logs must actually be emitted.
+
+    Python's root logger defaults to WARNING, so logger.info() calls in this
+    package were silently discarded in production while uvicorn's own access
+    logs appeared. Several real failures looked like silence because of it.
+    """
+
+    def test_configure_logging_enables_info_for_the_package(self):
+        import logging
+
+        from winch.app import configure_logging
+
+        logging.getLogger("winch").setLevel(logging.WARNING)
+        configure_logging("INFO")
+        assert logging.getLogger("winch").isEnabledFor(logging.INFO)
+        assert logging.getLogger("winch.webhook").isEnabledFor(logging.INFO)
+
+    def test_a_module_logger_actually_emits(self, caplog):
+        import logging
+
+        from winch.app import configure_logging
+
+        configure_logging("INFO")
+        with caplog.at_level(logging.INFO, logger="winch.app"):
+            logging.getLogger("winch.app").info("intake: quote=%s", "q1")
+        assert any("intake: quote=q1" in r.getMessage() for r in caplog.records)
+
+    def test_level_is_overridable(self):
+        import logging
+
+        from winch.app import configure_logging
+
+        configure_logging("WARNING")
+        assert not logging.getLogger("winch").isEnabledFor(logging.INFO)
+        configure_logging("INFO")
