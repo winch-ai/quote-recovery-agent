@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, FastAPI, Header, Response
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from psycopg_pool import AsyncConnectionPool
 from langgraph.types import Command
 
 from winch.channels.whatsapp import WhatsAppChannel
@@ -40,6 +41,7 @@ class Runtime:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.pool = None
+        self.cp_pool = None
         self.graph = None
         self.deduplicator = None
         self.queue = None
@@ -83,7 +85,18 @@ class Runtime:
             media_fetch=channel.download_media,
         )
 
-        checkpointer = AsyncPostgresSaver(self.pool)
+        # The checkpointer's setup() runs CREATE INDEX CONCURRENTLY, which
+        # Postgres refuses inside a transaction block. psycopg pools are
+        # transactional by default, so the checkpointer gets its own autocommit
+        # pool rather than making every app query autocommit.
+        self.cp_pool = AsyncConnectionPool(
+            s.database_url, min_size=1, max_size=4, open=False,
+            kwargs={"autocommit": True},
+        )
+        await self.cp_pool.open()
+        await self.cp_pool.wait()
+
+        checkpointer = AsyncPostgresSaver(self.cp_pool)
         await checkpointer.setup()
         self.graph = build_graph(deps, checkpointer=checkpointer)
 
@@ -108,8 +121,9 @@ class Runtime:
             return False
 
     async def stop(self) -> None:
-        if self.pool is not None:
-            await self.pool.close()
+        for pool in (self.cp_pool, self.pool):
+            if pool is not None:
+                await pool.close()
 
 
 class _CombinedLLM:
