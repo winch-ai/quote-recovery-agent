@@ -35,6 +35,20 @@ class ChannelAdapter(Protocol):
 
 
 @runtime_checkable
+class MessageDeduplicator(Protocol):
+    """Meta redelivers webhooks on any non-2xx, and on its own schedule.
+
+    Dedupe happens BEFORE state is touched, never after. `seen` must be atomic:
+    it records the id and reports whether it was already present, in one step.
+    A check-then-set pair races under concurrent delivery.
+    """
+
+    async def seen(self, provider_message_id: str) -> bool:
+        """Record the id. Return True if it had already been recorded."""
+        ...
+
+
+@runtime_checkable
 class LLMClient(Protocol):
     """Every model call goes through here, so tracing and cost live in one place."""
 
