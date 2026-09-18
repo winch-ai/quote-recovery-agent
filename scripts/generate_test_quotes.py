@@ -77,6 +77,7 @@ def au_shed(path):
     _line(c, 18 * mm, h - 19 * mm, "RIVERINA RURAL STRUCTURES", "Helvetica-Bold", 15, colors.white)
     _line(c, 18 * mm, h - 25 * mm, "ABN 44 128 991 023   |   Wagga Wagga NSW", size=9, fill=colors.white)
 
+    _line(c, 18 * mm, h - 40 * mm, "Quote QR-2291        Issued 11 September 2026", size=9)
     _line(c, 18 * mm, h - 45 * mm, "Proposal prepared for", "Helvetica-Bold", 11)
     _line(c, 18 * mm, h - 53 * mm, "Denise Okafor")
     _line(c, 18 * mm, h - 59 * mm, "'Barrenjoey', Old Narrandera Rd")
@@ -159,7 +160,7 @@ EXPECTED = {
         "note": "No phone anywhere - extractor MUST return null, not hallucinate. Email only.",
         "customer_name": "Denise Okafor", "customer_phone": None,
         "project_title": "18m x 24m machinery shed", "quote_total": 82840.00, "currency": "AUD",
-        "expiry_date": "2026-09-25",
+        "expiry_date": "2026-09-25",  # issued 11 Sep + "held for 14 days"
         "traps": ["no phone", "4 stage payments could be mistaken for total", "'INVESTMENT' not 'total'"],
     },
     "ie_groundworks.pdf": {
