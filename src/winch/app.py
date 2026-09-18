@@ -286,12 +286,20 @@ async def _route_event(runtime: Runtime, settings: Settings, event: ParsedEvent)
         quote_id = new_quote_id()
         logger.info("intake: quote=%s media=%s mime=%s", quote_id,
                     event.media_id, event.media_mime)
-        await runtime.threads.mark_awaiting(quote_id, True)
+        # mark_awaiting is set AFTER a successful invocation, conditioned on an
+        # actual interrupt existing - not before. Setting it beforehand left a
+        # thread permanently flagged "awaiting" if the graph crashed before
+        # ever reaching an interrupt (e.g. media download failing on an
+        # expired token): pending_thread()'s "most recently awaiting" fallback
+        # then hijacked the contractor's NEXT, unrelated plain-text message
+        # into retrying that dead, crashed quote instead of treating it fresh.
         result = await runtime.graph.ainvoke(
             {"quote_id": quote_id, "media_id": event.media_id,
              "status": QuoteStatus.DRAFT, "_entry": Entry.INTAKE},
             {"configurable": {"thread_id": quote_id}},
         )
+        if result.get("__interrupt__"):
+            await runtime.threads.mark_awaiting(quote_id, True)
         await _notify_contractor_of_interrupt(
             runtime, runtime.contractor_channel, settings.contractor_wa_id, result, quote_id)
         logger.info("intake complete: quote=%s", quote_id)

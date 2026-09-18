@@ -966,3 +966,179 @@ class TestContractorMessageWithNothingPending:
         assert len(sent) == 1
         assert sent[0][0] == "447700900555"
         assert "nothing outstanding" in sent[0][1].lower()
+
+
+class TestCrashedIntakeDoesNotPoisonFutureMessages:
+    """A real production incident: intake crashed (media download failed on
+    an expired token) before the graph ever reached an interrupt. The thread
+    had already been marked 'awaiting' before the graph ran, so it stayed
+    awaiting forever with nothing genuinely pending. The contractor's very
+    next, completely unrelated plain-text message ('hello there') was then
+    hijacked by pending_thread()'s 'most recently awaiting' fallback into
+    retrying that dead, crashed quote - and failed the exact same way,
+    instead of getting the 'nothing outstanding' acknowledgment it should
+    have.
+    """
+
+    def _runtime_and_settings(self, monkeypatch):
+        for k, v in {
+            "AZURE_OPENAI_ENDPOINT": "https://e.openai.azure.com",
+            "AZURE_OPENAI_API_KEY": "k", "LLM_MODEL": "azure_openai:m",
+            "CONTRACTOR_WA_ID": "447700900555",
+        }.items():
+            monkeypatch.setenv(k, v)
+        from winch.app import Runtime
+        from winch.config import Settings
+        settings = Settings.from_env()
+        return Runtime(settings), settings
+
+    async def test_a_crashed_intake_never_marks_the_thread_awaiting(self, monkeypatch):
+        from winch.app import _handle
+        from winch.webhook import ParsedEvent
+        from datetime import datetime, timezone
+
+        runtime, settings = self._runtime_and_settings(monkeypatch)
+        marked = []
+
+        class FakeGraph:
+            async def ainvoke(self, state, config):
+                raise RuntimeError("media download failed: token expired")
+
+        class FakeThreads:
+            async def mark_awaiting(self, quote_id, awaiting):
+                marked.append((quote_id, awaiting))
+
+        class FakeContractorChannel:
+            async def send_freeform(self, to, body):
+                pass
+
+        class FakeContactWindow:
+            async def record_inbound(self, wa_id):
+                pass
+
+        runtime.graph = FakeGraph()
+        runtime.threads = FakeThreads()
+        runtime.contractor_channel = FakeContractorChannel()
+        runtime.contact_window = FakeContactWindow()
+
+        event = ParsedEvent(kind="message", provider_message_id="wamid.crash1",
+                           from_wa_id="447700900555", media_id="m1",
+                           media_mime="application/pdf",
+                           timestamp=datetime.now(timezone.utc))
+
+        with pytest.raises(RuntimeError):
+            await _handle(runtime, settings, event)
+
+        assert marked == [], (
+            "a crashed intake must never mark its thread awaiting - "
+            "otherwise it silently hijacks the contractor's next message"
+        )
+
+    async def test_a_successful_intake_that_interrupts_does_mark_awaiting(self, monkeypatch):
+        """Regression guard the other way: the normal, working case must
+        still mark the thread awaiting so a real reply can resume it."""
+        from winch.app import _handle
+        from winch.webhook import ParsedEvent
+        from datetime import datetime, timezone
+
+        runtime, settings = self._runtime_and_settings(monkeypatch)
+        marked = []
+
+        class FakeInterrupt:
+            value = {"kind": "collect_contact", "missing": ["customer_phone"], "draft": {}}
+
+        class FakeGraph:
+            async def ainvoke(self, state, config):
+                return {"__interrupt__": [FakeInterrupt()]}
+
+        class FakeThreads:
+            async def mark_awaiting(self, quote_id, awaiting):
+                marked.append((quote_id, awaiting))
+
+            async def record_prompt(self, quote_id, message_id):
+                pass
+
+        class FakeContractorChannel:
+            async def send_freeform(self, to, body):
+                from winch.protocols import SendResult
+                return SendResult(ok=True, provider_message_id="wamid.prompt1")
+
+        class FakeContactWindow:
+            async def record_inbound(self, wa_id):
+                pass
+
+        runtime.graph = FakeGraph()
+        runtime.threads = FakeThreads()
+        runtime.contractor_channel = FakeContractorChannel()
+        runtime.contact_window = FakeContactWindow()
+
+        event = ParsedEvent(kind="message", provider_message_id="wamid.ok2",
+                           from_wa_id="447700900555", media_id="m2",
+                           media_mime="application/pdf",
+                           timestamp=datetime.now(timezone.utc))
+        await _handle(runtime, settings, event)
+
+        assert len(marked) == 1
+        assert marked[0][1] is True
+
+    async def test_after_a_crash_a_new_unrelated_message_gets_acknowledged_not_retried(self, monkeypatch):
+        """The end-to-end regression: crash, then a plain message, must reach
+        the 'nothing pending' acknowledgment - not resume the dead thread."""
+        from winch.app import _handle
+        from winch.webhook import ParsedEvent
+        from datetime import datetime, timezone
+
+        runtime, settings = self._runtime_and_settings(monkeypatch)
+        sent = []
+        thread_store = {"awaiting": None, "closed": set()}
+
+        class FakeGraph:
+            async def ainvoke(self, state, config):
+                raise RuntimeError("media download failed: token expired")
+
+        class FakeThreads:
+            async def mark_awaiting(self, quote_id, awaiting):
+                if awaiting:
+                    thread_store["awaiting"] = quote_id
+                elif thread_store["awaiting"] == quote_id:
+                    thread_store["awaiting"] = None
+
+            async def resolve_reply(self, reply_to_message_id):
+                return None
+
+            async def pending_thread(self):
+                return thread_store["awaiting"]
+
+        class FakeContractorChannel:
+            async def send_freeform(self, to, body):
+                sent.append(body)
+                from winch.protocols import SendResult
+                return SendResult(ok=True, provider_message_id="wamid.x")
+
+        class FakeContactWindow:
+            async def record_inbound(self, wa_id):
+                pass
+
+        runtime.graph = FakeGraph()
+        runtime.threads = FakeThreads()
+        runtime.contractor_channel = FakeContractorChannel()
+        runtime.contact_window = FakeContactWindow()
+
+        crash_event = ParsedEvent(kind="message", provider_message_id="wamid.crash2",
+                                  from_wa_id="447700900555", media_id="m3",
+                                  media_mime="application/pdf",
+                                  timestamp=datetime.now(timezone.utc))
+        with pytest.raises(RuntimeError):
+            await _handle(runtime, settings, crash_event)
+
+        sent.clear()  # discard the "something went wrong" apology from the crash
+
+        followup = ParsedEvent(kind="message", provider_message_id="wamid.followup",
+                               from_wa_id="447700900555", text="hello there",
+                               timestamp=datetime.now(timezone.utc))
+        await _handle(runtime, settings, followup)
+
+        assert len(sent) == 1
+        assert "nothing outstanding" in sent[0].lower(), (
+            f"expected the nothing-pending acknowledgment, got: {sent[0]!r}"
+        )
