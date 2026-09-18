@@ -256,8 +256,10 @@ async def _thread_for_customer(runtime: Runtime, wa_id: str) -> str | None:
 def _internal_router(runtime: Runtime, settings: Settings) -> APIRouter:
     router = APIRouter()
 
-    @router.get("/healthz")
-    async def healthz() -> dict:
+    @router.get("/health")
+    async def health() -> dict:
+        """Not /healthz: Google's frontend intercepts that path on Cloud Run and
+        returns its own 404, so the request never reaches the container."""
         return {"ok": True}
 
     @router.post("/internal/tick")

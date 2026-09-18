@@ -145,6 +145,17 @@ In the Meta app dashboard, set the webhook callback URL to
 
 `*.run.app` carries a valid managed certificate, so no custom domain is needed.
 
+## Gotchas found on the first real deploy
+
+- **A fresh project's compute service account has no roles**, so the first
+  `--source` deploy fails with a storage 403 about the build bucket. See 3b.
+- **The LangGraph checkpointer needs an autocommit pool.** `setup()` issues
+  `CREATE INDEX CONCURRENTLY`, which Postgres refuses inside a transaction; the
+  container builds fine and then crashes on boot. It gets its own pool.
+- **Do not put the health endpoint at `/healthz`.** Google's frontend
+  intercepts that path on Cloud Run and returns its own 404 — the request never
+  reaches the container. It is at `/health`.
+
 ## Cost
 
 At pilot volume this sits inside free tiers apart from Cloud SQL, which is a few

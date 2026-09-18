@@ -113,6 +113,12 @@ class TestTickAuth:
         assert client.post("/internal/tick",
                            headers={"X-Tick-Secret": ""}).status_code == 403
 
-    def test_healthz_needs_no_secret(self, monkeypatch):
+    def test_health_needs_no_secret(self, monkeypatch):
         client = self._app(monkeypatch, "s3cret")
-        assert client.get("/healthz").status_code == 200
+        assert client.get("/health").status_code == 200
+
+    def test_health_is_not_at_healthz(self, monkeypatch):
+        """Google's frontend intercepts /healthz on Cloud Run - the request
+        never reaches the container, so the endpoint must not live there."""
+        client = self._app(monkeypatch, "s3cret")
+        assert client.get("/healthz").status_code == 404
