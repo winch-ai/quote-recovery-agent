@@ -1,4 +1,4 @@
-name: CI/CD
+name: CI
 
 on:
   push:
@@ -8,13 +8,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write   # required for Workload Identity Federation in the deploy job
-
-env:
-  GCP_PROJECT: my-winch-project
-  CLOUD_RUN_SERVICE: winch
-  CLOUD_RUN_REGION: europe-west2
-  CLOUD_SQL_INSTANCE: my-winch-project:europe-west2:winch-db
 
 jobs:
   test:
@@ -50,39 +43,3 @@ jobs:
         env:
           TEST_DATABASE_URL: postgresql://postgres:winchtest@localhost:55432/winch_test
         run: pytest tests/ -q
-
-  deploy:
-    needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    environment: production
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - id: auth
-        name: Authenticate to Google Cloud (Workload Identity Federation — no long-lived key)
-        uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: projects/000000000000/locations/global/workloadIdentityPools/github-actions/providers/github
-          service_account: github-deployer@my-winch-project.iam.gserviceaccount.com
-
-      - name: Set up gcloud
-        uses: google-github-actions/setup-gcloud@v2
-
-      - name: Deploy to Cloud Run
-        # Non-secret config is passed as plain env vars from repository variables
-        # (Settings > Secrets and variables > Actions > Variables); secret values
-        # stay in Secret Manager and are only ever referenced by name here, never
-        # read into this workflow.
-        run: |
-          gcloud run deploy "$CLOUD_RUN_SERVICE" \
-            --project="$GCP_PROJECT" --region="$CLOUD_RUN_REGION" --source=. \
-            --allow-unauthenticated \
-            --add-cloudsql-instances="$CLOUD_SQL_INSTANCE" \
-            --set-env-vars="AZURE_OPENAI_ENDPOINT=${{ vars.AZURE_OPENAI_ENDPOINT }},AZURE_OPENAI_API_VERSION=${{ vars.AZURE_OPENAI_API_VERSION }},LLM_MODEL=${{ vars.LLM_MODEL }},META_PHONE_NUMBER_ID=${{ vars.META_PHONE_NUMBER_ID }},META_GRAPH_VERSION=${{ vars.META_GRAPH_VERSION }},CONTRACTOR_WA_ID=${{ vars.CONTRACTOR_WA_ID }},CONTRACTOR_FIRST_NAME=${{ vars.CONTRACTOR_FIRST_NAME }},CONTRACTOR_BUSINESS_NAME=${{ vars.CONTRACTOR_BUSINESS_NAME }},CONTRACTOR_TIMEZONE=${{ vars.CONTRACTOR_TIMEZONE }},PRIVACY_CONTACT_EMAIL=${{ vars.PRIVACY_CONTACT_EMAIL }},PRIVACY_OPERATOR_NAME=${{ vars.PRIVACY_OPERATOR_NAME }}" \
-            --set-secrets="AZURE_OPENAI_API_KEY=AZURE_OPENAI_API_KEY:latest,META_ACCESS_TOKEN=META_ACCESS_TOKEN:latest,META_APP_SECRET=META_APP_SECRET:latest,META_VERIFY_TOKEN=META_VERIFY_TOKEN:latest,TICK_SECRET=TICK_SECRET:latest,DATABASE_URL=DATABASE_URL:latest" \
-            --memory=1Gi --cpu=1 --timeout=300 --max-instances=3 \
-            --quiet

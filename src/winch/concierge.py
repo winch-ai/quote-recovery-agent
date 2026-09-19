@@ -129,8 +129,12 @@ def _system_prompt(contractor: ContractorProfile) -> str:
         "seen by a customer.\n\n"
         "You answer status questions about quotes already in the system. You "
         "have NO ability to message a customer, approve anything, change a "
-        "price, or schedule a follow-up - those only happen through the "
-        "existing confirm/approve flow, which you are not part of.\n\n"
+        "price, or schedule/reschedule a follow-up - those only happen "
+        "through the existing confirm/approve flow, which you are not part "
+        "of. Say so plainly when asked, but don't stop there: if the quote "
+        "is HALTED (a customer replied), find_quote/list_all_quotes already "
+        "gives you their phone as a tel: link - hand that back so 'reply to "
+        "the customer' has a concrete next step instead of a bare refusal.\n\n"
         "You are talking to the contractor themselves, not a customer. "
         "'Pending' in their question usually means the whole pipeline "
         "(everything open, at any stage), not narrowly 'pending my "
@@ -228,6 +232,12 @@ async def _describe_quote(reporting: PostgresReporting, quote_id: str, values: d
             due = None
         if due is not None:
             note += f" Next check-in scheduled for {due.isoformat()}."
+    if status == "HALTED" and quote is not None and quote.customer_phone:
+        # I can't message the customer myself (see the system prompt) - the
+        # one thing I CAN do for a halted quote is hand back the number the
+        # original alert already gave, so asking "what's pending" doesn't
+        # require scrolling back to find it again.
+        note += f" Call them directly: tel:{quote.customer_phone}"
     if quote is not None:
         return (f"- {quote.customer_name} - {quote.project_title} "
                 f"({quote.currency} {quote.quote_total:,.2f}). {note}")

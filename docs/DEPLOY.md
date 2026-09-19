@@ -1,21 +1,20 @@
 # Deploying to Cloud Run
 
-## Provisioned state
+This is the runbook used to stand up the original pilot's infrastructure —
+kept here as a reference for rebuilding the same setup against your own GCP
+project. Substitute your own project id, org, and region throughout.
 
-| Thing | Value |
+| Thing | Example value |
 | GCP project | `my-winch-project` (separate from any other project) |
 | Organisation | `your-gcp-org` |
 | Region | `europe-west2` (London) — keeps customer data in-region for UK GDPR |
 | Cloud SQL | `winch-db`, POSTGRES_16, `db-f1-micro`, 10GB, database `winch` |
 | Secret | `DATABASE_URL` in Secret Manager; the password was generated and stored without ever being printed |
 
-Steps 1 and 2 below are **already done**. They are kept for rebuilding from
-scratch.
-
-## 1. Project and services (done)
+## 1. Project and services
 
 ```bash
-gcloud projects create my-winch-project --name="Quote Recovery Agent" \
+gcloud projects create my-winch-project --name="Winch" \
     --organization=<ORG_ID>
 gcloud billing projects link my-winch-project --billing-account=<BILLING_ID>
 gcloud services enable run.googleapis.com sqladmin.googleapis.com \
@@ -24,7 +23,7 @@ gcloud services enable run.googleapis.com sqladmin.googleapis.com \
     --project=my-winch-project
 ```
 
-## 2. Database (done)
+## 2. Database
 
 Smallest tier is ample: one contractor, tens of quotes.
 

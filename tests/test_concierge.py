@@ -220,12 +220,12 @@ async def test_find_quote_reports_frozen_status_not_editable(anyio_backend):
         {
             "role": "assistant",
             "content": None,
-            "tool_calls": [_tool_call("find_quote", {"query": "Peter"})],
+            "tool_calls": [_tool_call("find_quote", {"query": "Jamie"})],
         },
         {"role": "assistant", "content": "Jamie Doyle's quote is approved and locked in - can't change the price here."},
     ])
     reply = await handle_general_message(
-        text="can I change Peter's quote",
+        text="can I change Jamie's quote",
         contractor=_profile(),
         threads=_FakeThreads(awaiting=[], open_=["q2"]),
         reporting=_FakeReporting({}),
@@ -249,9 +249,9 @@ async def test_find_quote_active_reports_scheduled_touchpoint_time(anyio_backend
         {
             "role": "assistant",
             "content": None,
-            "tool_calls": [_tool_call("find_quote", {"query": "Peter"})],
+            "tool_calls": [_tool_call("find_quote", {"query": "Jamie"})],
         },
-        {"role": "assistant", "content": "Peter's next check-in goes out at 14:00 UTC."},
+        {"role": "assistant", "content": "Jamie's next check-in goes out at 14:00 UTC."},
     ])
     reply = await handle_general_message(
         text="what time will you check in with him today",
@@ -264,6 +264,38 @@ async def test_find_quote_active_reports_scheduled_touchpoint_time(anyio_backend
     assert reply
     tool_messages = [m for m in llm.calls[1] if m.get("role") == "tool"]
     assert due.isoformat() in tool_messages[0]["content"]
+
+
+@pytest.mark.anyio
+async def test_halted_quote_surfaces_customer_phone_for_direct_contact(anyio_backend):
+    """Regression: a contractor asked the concierge to 'reply to the
+    customer' for a halted quote and got a bare refusal, even though the
+    customer's number was already in state (the original alert had it) - the
+    concierge just never handed it back."""
+    quote = Quote(
+        quote_id="q4", customer_name="Jamie Doyle", customer_phone="447700900321",
+        customer_email=None, project_title="Perimeter fencing", scope_summary=None,
+        quote_total=2340.0, currency="GBP", expiry_date=None,
+    )
+    llm = _ScriptedLLM([
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [_tool_call("find_quote", {"query": "Jamie"})],
+        },
+        {"role": "assistant", "content": "I can't message him, but you can call: tel:447700900321"},
+    ])
+    reply = await handle_general_message(
+        text="reply to the customer",
+        contractor=_profile(),
+        threads=_FakeThreads(awaiting=[], open_=["q4"]),
+        reporting=_FakeReporting({}),
+        graph=_FakeGraph({"q4": {"quote": quote, "status": "HALTED"}}),
+        llm=llm,
+    )
+    assert "tel:447700900321" in reply
+    tool_messages = [m for m in llm.calls[1] if m.get("role") == "tool"]
+    assert "tel:447700900321" in tool_messages[0]["content"]
 
 
 @pytest.mark.anyio
