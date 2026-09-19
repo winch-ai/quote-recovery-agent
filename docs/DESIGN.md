@@ -134,6 +134,19 @@ replay would silently corrupt the only number that matters.
 **`Command(resume={})` is ignored.** An empty payload does not resume — the node
 interrupts again and the graph looks stuck rather than erroring. Nothing may
 construct an empty resume payload; pinned by `test_app_wiring.py`.
+
+**`StateSnapshot.next` is not a reliable "is something pending" signal after a
+resume that re-pauses on a second `interrupt()` call within the same node**
+(e.g. `await_confirm`'s approve → `_clarify_timing` urgency loop). Confirmed
+by direct reproduction against the real graph, not assumed: `next` comes back
+empty in that case even though the graph genuinely paused.
+`app._sync_thread_index` used to trust `next` to decide whether to keep a
+quote flagged `awaiting`, so it cleared the flag one turn early — a plain-text
+(non-swipe-reply) answer to that second question then found no pending
+thread and silently fell through to the concierge instead of resuming.
+`StateSnapshot.interrupts` reflects the pending interrupt correctly in this
+same case and is what the fix checks instead; pinned by
+`TestAwaitingFlagSurvivesANestedInterrupt` in `test_app_wiring.py`.
 | `triage` | Inbound customer reply → intent | yes |
 | `alert` | Halt sequence, tap-to-call / reply link to contractor | — |
 | `archive` | Terminal state | — |

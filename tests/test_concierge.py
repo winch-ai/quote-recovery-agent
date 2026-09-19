@@ -29,19 +29,27 @@ def _profile() -> ContractorProfile:
 
 
 class _FakeThreads:
-    def __init__(self, awaiting: list[str]) -> None:
+    def __init__(self, awaiting: list[str], open_: list[str] | None = None) -> None:
         self._awaiting = awaiting
+        self._open = open_ if open_ is not None else list(awaiting)
 
     async def list_awaiting(self) -> list[str]:
         return list(self._awaiting)
 
+    async def list_open(self) -> list[str]:
+        return list(self._open)
+
 
 class _FakeReporting:
-    def __init__(self, counts: dict[str, int]) -> None:
+    def __init__(self, counts: dict[str, int], next_due: dict[str, datetime] | None = None) -> None:
         self._counts = counts
+        self._next_due = next_due or {}
 
     async def count_events_since(self, event_type, since) -> int:
         return self._counts.get(event_type.value, 0)
+
+    async def next_touchpoint_due(self, quote_id: str):
+        return self._next_due.get(quote_id)
 
 
 class _FakeSnapshot:
@@ -164,6 +172,86 @@ async def test_runaway_tool_loop_is_capped(anyio_backend):
     )
     assert reply  # terminates with *some* string rather than hanging/crashing
     assert len(llm.calls) <= MAX_TOOL_TURNS + 1
+
+
+@pytest.mark.anyio
+async def test_find_quote_reports_frozen_status_not_editable(anyio_backend):
+    quote = Quote(
+        quote_id="q2", customer_name="Jamie Doyle", customer_phone=None,
+        customer_email=None, project_title="Perimeter fencing", scope_summary=None,
+        quote_total=2340.0, currency="GBP", expiry_date=None,
+    )
+    llm = _ScriptedLLM([
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [_tool_call("find_quote", {"query": "Peter"})],
+        },
+        {"role": "assistant", "content": "Jamie Doyle's quote is approved and locked in - can't change the price here."},
+    ])
+    reply = await handle_general_message(
+        text="can I change Peter's quote",
+        contractor=_profile(),
+        threads=_FakeThreads(awaiting=[], open_=["q2"]),
+        reporting=_FakeReporting({}),
+        graph=_FakeGraph({"q2": {"quote": quote, "status": "ACTIVE"}}),
+        llm=llm,
+    )
+    assert "locked in" in reply.lower() or "can't change" in reply.lower()
+    tool_messages = [m for m in llm.calls[1] if m.get("role") == "tool"]
+    assert "locked in" in tool_messages[0]["content"].lower()
+
+
+@pytest.mark.anyio
+async def test_find_quote_active_reports_scheduled_touchpoint_time(anyio_backend):
+    quote = Quote(
+        quote_id="q3", customer_name="Jamie Doyle", customer_phone=None,
+        customer_email=None, project_title="Perimeter fencing", scope_summary=None,
+        quote_total=2340.0, currency="GBP", expiry_date=None,
+    )
+    due = datetime(2026, 9, 19, 14, 0, tzinfo=timezone.utc)
+    llm = _ScriptedLLM([
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [_tool_call("find_quote", {"query": "Peter"})],
+        },
+        {"role": "assistant", "content": "Peter's next check-in goes out at 14:00 UTC."},
+    ])
+    reply = await handle_general_message(
+        text="what time will you check in with him today",
+        contractor=_profile(),
+        threads=_FakeThreads(awaiting=[], open_=["q3"]),
+        reporting=_FakeReporting({}, next_due={"q3": due}),
+        graph=_FakeGraph({"q3": {"quote": quote, "status": "ACTIVE"}}),
+        llm=llm,
+    )
+    assert reply
+    tool_messages = [m for m in llm.calls[1] if m.get("role") == "tool"]
+    assert due.isoformat() in tool_messages[0]["content"]
+
+
+@pytest.mark.anyio
+async def test_find_quote_no_match(anyio_backend):
+    llm = _ScriptedLLM([
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [_tool_call("find_quote", {"query": "nobody"})],
+        },
+        {"role": "assistant", "content": "I couldn't find a quote matching that."},
+    ])
+    reply = await handle_general_message(
+        text="what about the Smith quote",
+        contractor=_profile(),
+        threads=_FakeThreads(awaiting=[], open_=[]),
+        reporting=_FakeReporting({}),
+        graph=_FakeGraph({}),
+        llm=llm,
+    )
+    assert reply
+    tool_messages = [m for m in llm.calls[1] if m.get("role") == "tool"]
+    assert "no quote found" in tool_messages[0]["content"].lower()
 
 
 @pytest.mark.anyio

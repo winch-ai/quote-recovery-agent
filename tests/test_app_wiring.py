@@ -1144,6 +1144,96 @@ class TestCrashedIntakeDoesNotPoisonFutureMessages:
         )
 
 
+class TestAwaitingFlagSurvivesANestedInterrupt:
+    """Real production bug: nodes.await_confirm can pause on a SECOND
+    interrupt() call within the same node execution (the approve -> "today or
+    normal schedule?" urgency clarification in _clarify_timing). After that
+    resume, LangGraph's StateSnapshot.next comes back empty even though the
+    graph genuinely re-paused - confirmed by direct reproduction against the
+    real graph, not assumed. _sync_thread_index previously trusted `next` to
+    decide whether to keep the thread flagged 'awaiting', so it cleared the
+    flag one turn early. The contractor's next plain-text reply ("yes, today")
+    then found no pending thread and fell through to the concierge instead of
+    resuming - the exact "why does it keep asking stupid questions and
+    forgetting what we were just doing" failure. snapshot.interrupts is the
+    field that actually reflects this correctly; that's what the fix checks.
+    """
+
+    def _runtime_and_settings(self, monkeypatch):
+        for k, v in {
+            "AZURE_OPENAI_ENDPOINT": "https://e.openai.azure.com",
+            "AZURE_OPENAI_API_KEY": "k", "LLM_MODEL": "azure_openai:m",
+            "CONTRACTOR_WA_ID": "447700900555",
+        }.items():
+            monkeypatch.setenv(k, v)
+        from winch.app import Runtime
+        from winch.config import Settings
+        settings = Settings.from_env()
+        return Runtime(settings), settings
+
+    async def test_mark_awaiting_true_when_next_is_empty_but_interrupts_is_not(self, monkeypatch):
+        from winch.app import _handle
+        from winch.protocols import SendResult
+
+        runtime, settings = self._runtime_and_settings(monkeypatch)
+        marked = []
+        thread_store = {"awaiting": "q1"}  # already awaiting from the prior turn
+
+        class FakeInterrupt:
+            value = {"kind": "confirm_timing"}
+
+        class FakeSnapshot:
+            values = {"status": "AWAITING_APPROVAL", "quote": None}
+            next = ()  # the buggy signal: empty even though genuinely paused
+            interrupts = (FakeInterrupt(),)  # the correct signal
+
+        class FakeGraph:
+            async def ainvoke(self, command, config):
+                return {"__interrupt__": [FakeInterrupt()]}
+
+            async def aget_state(self, config):
+                return FakeSnapshot()
+
+        class FakeThreads:
+            async def resolve_reply(self, reply_to_message_id):
+                return None
+
+            async def pending_thread(self):
+                return thread_store["awaiting"]
+
+            async def mark_awaiting(self, quote_id, awaiting):
+                marked.append((quote_id, awaiting))
+                thread_store["awaiting"] = quote_id if awaiting else None
+
+            async def record_prompt(self, quote_id, message_id):
+                pass
+
+        class FakeContractorChannel:
+            async def send_freeform(self, to, body):
+                return SendResult(ok=True, provider_message_id="wamid.timing1")
+
+        class FakeContactWindow:
+            async def record_inbound(self, wa_id):
+                pass
+
+        runtime.graph = FakeGraph()
+        runtime.threads = FakeThreads()
+        runtime.contractor_channel = FakeContractorChannel()
+        runtime.contact_window = FakeContactWindow()
+
+        event = ParsedEvent(kind="message", provider_message_id="wamid.reply1",
+                            from_wa_id="447700900555", text="check in now actually",
+                            timestamp=datetime.now(timezone.utc))
+        await _handle(runtime, settings, event)
+
+        assert marked == [("q1", True)], (
+            "the thread must stay flagged awaiting after a resume that "
+            "re-pauses on a nested interrupt, even though snapshot.next is "
+            "empty - otherwise the next plain-text reply can't find it"
+        )
+        assert thread_store["awaiting"] == "q1"
+
+
 class TestCombinedLLMSatisfiesTheProtocol:
     """The exact bug that hit production: classify_contractor_reply was added
     to the LLMClient protocol, to AzureTextClient, and to every test fake -

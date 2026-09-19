@@ -525,7 +525,16 @@ async def _sync_thread_index(runtime: Runtime, thread: str) -> None:
     if values.get("status") == QuoteStatus.CLOSED:
         await runtime.threads.close(thread)
         return
-    await runtime.threads.mark_awaiting(thread, bool(snapshot.next))
+    # snapshot.next is NOT reliable here: after a Command(resume=...) that
+    # re-pauses on a second interrupt() call within the same node (e.g. the
+    # approve -> urgency-clarification loop in nodes.await_confirm),
+    # LangGraph returns an empty `next` even though a real interrupt is
+    # pending - confirmed by reproduction, not assumption. snapshot.interrupts
+    # reflects the pending interrupt correctly in that same case. Using `next`
+    # here previously cleared the awaiting flag one turn early, so a plain
+    # (non-swipe-reply) answer to that second question found no pending
+    # thread and silently fell through to the concierge instead of resuming.
+    await runtime.threads.mark_awaiting(thread, bool(snapshot.interrupts))
 
 
 def _parse_contractor_reply(event: ParsedEvent) -> dict:

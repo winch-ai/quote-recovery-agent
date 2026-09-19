@@ -202,6 +202,23 @@ class PostgresReporting:
     def __init__(self, pool: AsyncConnectionPool) -> None:
         self._pool = pool
 
+    async def next_touchpoint_due(self, quote_id: str) -> datetime | None:
+        """The soonest not-yet-sent touchpoint for a quote, if any. Read-only -
+        used by winch.concierge.find_quote to answer "what time" questions
+        with the real scheduled time instead of declining to know."""
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT due_at FROM touchpoints
+                    WHERE quote_id = %s AND status IN ('PENDING', 'AWAITING_GATE', 'APPROVED')
+                    ORDER BY due_at ASC LIMIT 1;
+                    """,
+                    (quote_id,),
+                )
+                row = await cur.fetchone()
+                return row[0] if row is not None else None
+
     async def count_events_since(self, event_type: EventType, since: datetime) -> int:
         event_type_str = event_type.value if hasattr(event_type, "value") else str(event_type)
         since_param = since if since.tzinfo is not None else since.replace(tzinfo=timezone.utc)
@@ -373,6 +390,28 @@ class PostgresThreadIndex:
                     """,
                     (provider_message_id, quote_id),
                 )
+
+    async def list_open(self) -> list[str]:
+        """All non-closed quote_ids, awaiting or not, most recent first.
+
+        Read-only reporting query for winch.concierge.find_quote - unlike
+        list_awaiting(), this also covers ACTIVE/HALTED quotes so a contractor
+        asking "who was quote X addressed to" or "can I change something on
+        it" gets a grounded answer (and, for an already-approved quote, a
+        grounded "no, it's locked in") instead of the concierge guessing.
+        """
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT quote_id
+                    FROM quote_threads
+                    WHERE closed = false
+                    ORDER BY updated_at DESC;
+                    """
+                )
+                rows = await cur.fetchall()
+                return [row[0] for row in rows]
 
     async def list_awaiting(self) -> list[str]:
         """quote_ids currently waiting on a contractor answer, most recent first.

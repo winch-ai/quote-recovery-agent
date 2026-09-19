@@ -57,6 +57,31 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "find_quote",
+            "description": (
+                "Look up a specific quote by customer name or project keyword "
+                "- e.g. 'Jamie Doyle', 'fencing'. Returns who it's for, the "
+                "project, the total, whether it can still be changed, and (for "
+                "an active quote) when its next check-in is actually "
+                "scheduled. Use this before answering 'who was it addressed "
+                "to', 'what's the status of X', 'what time will it go out', "
+                "or a request to edit/change a quote."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Customer name or project keyword to search for.",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "count_recent_activity",
             "description": (
                 "Count quotes received and follow-up messages sent in the "
@@ -86,6 +111,15 @@ def _system_prompt(contractor: ContractorProfile) -> str:
         "have NO ability to message a customer, approve anything, change a "
         "price, or schedule a follow-up - those only happen through the "
         "existing confirm/approve flow, which you are not part of.\n\n"
+        "If asked to edit or change a quote: look it up with find_quote first. "
+        "A quote still awaiting approval is edited by replying directly to my "
+        "original confirmation message for it (not here) - tell them that. A "
+        "quote already approved is frozen and cannot be changed at all - "
+        "changing the price on an approved quote is exactly what this system "
+        "exists to prevent, since a wrong number sent to a customer is the "
+        "contractor's legal exposure, not yours to fix by editing text. If the "
+        "real quote changed, the fix is forwarding the corrected document as "
+        "a new quote, never rewriting the number here.\n\n"
         "A quote is only created by the contractor forwarding the PDF or "
         "photo of it - that is the one way one enters the system, because "
         "extraction depends on the real document. You cannot 'create' or "
@@ -134,6 +168,72 @@ async def _list_pending_quotes(threads: PostgresThreadIndex, graph: Any) -> str:
     return "Awaiting your answer:\n" + "\n".join(lines)
 
 
+_EDITABLE_NOTE = {
+    "DRAFT": "still being set up - reply to my message about it to confirm details.",
+    "AWAITING_CONTACT": "still waiting on the customer's contact details from you.",
+    "AWAITING_APPROVAL": (
+        "still awaiting your approval - reply directly to my confirmation "
+        "message for this one (not this chat) to approve it or ask for a "
+        "change; that reopens it for editing before anything is locked in."
+    ),
+    "ACTIVE": (
+        "already approved and locked in - the price and scope can't be "
+        "changed here. If it changed on paper, forward the corrected "
+        "document and I'll treat it as a new quote."
+    ),
+    "HALTED": "paused because the customer replied - that needs your direct attention.",
+    "CLOSED": "closed.",
+}
+
+
+async def _find_quote(threads: PostgresThreadIndex, reporting: PostgresReporting,
+                       graph: Any, query: Any) -> str:
+    query = str(query or "").strip().lower()
+    if not query:
+        return "Give me a customer name or project keyword to search for."
+
+    quote_ids = await threads.list_open()
+    matches = []
+    for quote_id in quote_ids:
+        try:
+            snapshot = await graph.aget_state({"configurable": {"thread_id": quote_id}})
+            values = snapshot.values if snapshot is not None else {}
+        except Exception:
+            logger.exception("concierge: failed to read state for %s", quote_id)
+            continue
+        quote = values.get("quote")
+        draft = values.get("draft")
+        status = str(values.get("status") or "")
+        name = quote.customer_name if quote is not None else None
+        project = (quote.project_title if quote is not None
+                   else draft.project_title if draft is not None else None)
+        haystack = " ".join(filter(None, [name, project])).lower()
+        if query not in haystack:
+            continue
+        note = _EDITABLE_NOTE.get(status, "status unclear.")
+        if status == "ACTIVE":
+            try:
+                due = await reporting.next_touchpoint_due(quote_id)
+            except Exception:
+                logger.exception("concierge: failed to read next touchpoint for %s", quote_id)
+                due = None
+            if due is not None:
+                note += f" Next check-in scheduled for {due.isoformat()}."
+        if quote is not None:
+            matches.append(
+                f"- {quote.customer_name} - {quote.project_title} "
+                f"({quote.currency} {quote.quote_total:,.2f}). {note}"
+            )
+        elif draft is not None:
+            matches.append(f"- {draft.project_title} (details not yet confirmed). {note}")
+        if len(matches) >= 5:
+            break
+
+    if not matches:
+        return f"No quote found matching '{query}'."
+    return "\n".join(matches)
+
+
 async def _count_recent_activity(reporting: PostgresReporting, days: Any) -> str:
     try:
         window = max(1, min(int(days), 90))
@@ -180,6 +280,8 @@ def _build_graph(threads: PostgresThreadIndex, reporting: PostgresReporting,
             try:
                 if name == "list_pending_quotes":
                     content = await _list_pending_quotes(threads, graph)
+                elif name == "find_quote":
+                    content = await _find_quote(threads, reporting, graph, args.get("query"))
                 elif name == "count_recent_activity":
                     content = await _count_recent_activity(reporting, args.get("days", 7))
                 else:
