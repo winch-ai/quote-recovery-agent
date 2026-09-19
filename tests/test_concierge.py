@@ -175,6 +175,41 @@ async def test_runaway_tool_loop_is_capped(anyio_backend):
 
 
 @pytest.mark.anyio
+async def test_list_all_quotes_includes_active_not_just_awaiting(anyio_backend):
+    """Regression: 'how many quotes and what's the status of each' must
+    include an already-approved, actively-running quote, not just the ones
+    literally blocked on the contractor's own reply. Real production
+    confusion: a contractor asked this with one ACTIVE quote in flight and
+    got 'no quotes pending', which reads as the bot not knowing who's
+    talking to it."""
+    quote = Quote(
+        quote_id="q1", customer_name="Jamie Doyle", customer_phone=None,
+        customer_email=None, project_title="Perimeter fencing", scope_summary=None,
+        quote_total=2340.0, currency="GBP", expiry_date=None,
+    )
+    llm = _ScriptedLLM([
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [_tool_call("list_all_quotes", {})],
+        },
+        {"role": "assistant", "content": "You have 1 open quote: Jamie Doyle, approved, following up."},
+    ])
+    reply = await handle_general_message(
+        text="how many quotes do we have pending and what is the status of each",
+        contractor=_profile(),
+        threads=_FakeThreads(awaiting=[], open_=["q1"]),  # NOT in list_awaiting - only list_open
+        reporting=_FakeReporting({}),
+        graph=_FakeGraph({"q1": {"quote": quote, "status": "ACTIVE"}}),
+        llm=llm,
+    )
+    assert "Jamie Doyle" in reply
+    tool_messages = [m for m in llm.calls[1] if m.get("role") == "tool"]
+    assert "Jamie Doyle" in tool_messages[0]["content"]
+    assert "approved and locked in" in tool_messages[0]["content"].lower()
+
+
+@pytest.mark.anyio
 async def test_find_quote_reports_frozen_status_not_editable(anyio_backend):
     quote = Quote(
         quote_id="q2", customer_name="Jamie Doyle", customer_phone=None,

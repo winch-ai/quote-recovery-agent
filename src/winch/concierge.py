@@ -46,10 +46,30 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "list_pending_quotes",
             "description": (
-                "List quotes currently waiting on a contractor answer "
-                "(confirmation or approval). Use for questions like "
-                "'what's pending', 'what's outstanding', 'what do you need "
-                "from me'."
+                "List ONLY the quotes waiting on a contractor answer right "
+                "now (confirmation or approval) - i.e. what's blocking YOU "
+                "specifically. Use only for narrow questions like 'what do "
+                "you need from me', 'what am I blocking', 'what's waiting on "
+                "my reply'. Do NOT use this for 'how many quotes do we have' "
+                "or 'what's the status of each' - those mean every quote in "
+                "the system, not just the ones stuck on you. Use "
+                "list_all_quotes for those instead."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_all_quotes",
+            "description": (
+                "List every quote currently open in the system - awaiting "
+                "your reply, approved and actively following up, or halted "
+                "for your attention - each with its status. Use this for "
+                "'how many quotes do we have', 'what's the status of each', "
+                "'what's in the pipeline', or any broad status question. "
+                "This is the default choice unless the question is "
+                "specifically and only about what YOU still need to answer."
             ),
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
@@ -111,6 +131,15 @@ def _system_prompt(contractor: ContractorProfile) -> str:
         "have NO ability to message a customer, approve anything, change a "
         "price, or schedule a follow-up - those only happen through the "
         "existing confirm/approve flow, which you are not part of.\n\n"
+        "You are talking to the contractor themselves, not a customer. "
+        "'Pending' in their question usually means the whole pipeline "
+        "(everything open, at any stage), not narrowly 'pending my "
+        "approval' - a quote already approved and actively following up is "
+        "still something they'd expect listed when they ask how many quotes "
+        "exist or what the status of each one is. Default to "
+        "list_all_quotes for any broad status question; reserve "
+        "list_pending_quotes for when they specifically ask what's blocked "
+        "on their own reply.\n\n"
         "If asked to edit or change a quote: look it up with find_quote first. "
         "A quote still awaiting approval is edited by replying directly to my "
         "original confirmation message for it (not here) - tell them that. A "
@@ -186,6 +215,45 @@ _EDITABLE_NOTE = {
 }
 
 
+async def _describe_quote(reporting: PostgresReporting, quote_id: str, values: dict) -> str:
+    quote = values.get("quote")
+    draft = values.get("draft")
+    status = str(values.get("status") or "")
+    note = _EDITABLE_NOTE.get(status, "status unclear.")
+    if status == "ACTIVE":
+        try:
+            due = await reporting.next_touchpoint_due(quote_id)
+        except Exception:
+            logger.exception("concierge: failed to read next touchpoint for %s", quote_id)
+            due = None
+        if due is not None:
+            note += f" Next check-in scheduled for {due.isoformat()}."
+    if quote is not None:
+        return (f"- {quote.customer_name} - {quote.project_title} "
+                f"({quote.currency} {quote.quote_total:,.2f}). {note}")
+    if draft is not None:
+        return f"- {draft.project_title} (details not yet confirmed). {note}"
+    return f"- quote {quote_id}. {note}"
+
+
+async def _list_all_quotes(threads: PostgresThreadIndex, reporting: PostgresReporting,
+                            graph: Any) -> str:
+    quote_ids = await threads.list_open()
+    if not quote_ids:
+        return "There are no open quotes in the system right now."
+
+    lines = []
+    for quote_id in quote_ids[:20]:
+        try:
+            snapshot = await graph.aget_state({"configurable": {"thread_id": quote_id}})
+            values = snapshot.values if snapshot is not None else {}
+        except Exception:
+            logger.exception("concierge: failed to read state for %s", quote_id)
+            values = {}
+        lines.append(await _describe_quote(reporting, quote_id, values))
+    return f"{len(quote_ids)} open quote(s):\n" + "\n".join(lines)
+
+
 async def _find_quote(threads: PostgresThreadIndex, reporting: PostgresReporting,
                        graph: Any, query: Any) -> str:
     query = str(query or "").strip().lower()
@@ -203,29 +271,13 @@ async def _find_quote(threads: PostgresThreadIndex, reporting: PostgresReporting
             continue
         quote = values.get("quote")
         draft = values.get("draft")
-        status = str(values.get("status") or "")
         name = quote.customer_name if quote is not None else None
         project = (quote.project_title if quote is not None
                    else draft.project_title if draft is not None else None)
         haystack = " ".join(filter(None, [name, project])).lower()
         if query not in haystack:
             continue
-        note = _EDITABLE_NOTE.get(status, "status unclear.")
-        if status == "ACTIVE":
-            try:
-                due = await reporting.next_touchpoint_due(quote_id)
-            except Exception:
-                logger.exception("concierge: failed to read next touchpoint for %s", quote_id)
-                due = None
-            if due is not None:
-                note += f" Next check-in scheduled for {due.isoformat()}."
-        if quote is not None:
-            matches.append(
-                f"- {quote.customer_name} - {quote.project_title} "
-                f"({quote.currency} {quote.quote_total:,.2f}). {note}"
-            )
-        elif draft is not None:
-            matches.append(f"- {draft.project_title} (details not yet confirmed). {note}")
+        matches.append(await _describe_quote(reporting, quote_id, values))
         if len(matches) >= 5:
             break
 
@@ -280,6 +332,8 @@ def _build_graph(threads: PostgresThreadIndex, reporting: PostgresReporting,
             try:
                 if name == "list_pending_quotes":
                     content = await _list_pending_quotes(threads, graph)
+                elif name == "list_all_quotes":
+                    content = await _list_all_quotes(threads, reporting, graph)
                 elif name == "find_quote":
                     content = await _find_quote(threads, reporting, graph, args.get("query"))
                 elif name == "count_recent_activity":
