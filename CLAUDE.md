@@ -63,8 +63,20 @@ first, recovered-revenue share deferred (attribution is unwinnable early).
 ## Orchestration
 
 **The supervisor is deterministic** — routing is `(state, event_type)`, a truth table. No LLM router.
-LLM work sits in four specialists: Extractor (PDF/photo → schema), Composer (tone + template
-selection), Triage (inbound intent), and a Channel Resolver that is itself mostly code.
+This governs the quote lifecycle only: intake, confirm, gate, send, triage. LLM work there sits in
+four specialists: Extractor (PDF/photo → schema), Composer (tone + template selection), Triage
+(inbound intent), and a Channel Resolver that is itself mostly code.
+
+**The Concierge (`winch/concierge.py`) is a separate, fifth specialist, and it is agentic on
+purpose.** It answers a contractor's free-text message when nothing is pending on the deterministic
+path — status questions like "what's pending" or "how many went out this week" — via a small
+LangGraph tool-calling loop instead of the single hardcoded acknowledgement that path used to return
+regardless of what was asked. It is scoped tightly and stays outside the truth table above: its
+tools are read-only (list awaiting quotes, count recent event-log activity) and it has no way to
+send to a customer, approve anything, change a price, schedule a touchpoint, or create a quote —
+creating one still requires forwarding the actual document, because extraction depends on it. Hard
+rules 1, 2 and 4 are about the quote lifecycle's supervisor and remain untouched; the Concierge was
+deliberately kept out of that lifecycle rather than exempted from those rules.
 
 ## LangGraph shape
 

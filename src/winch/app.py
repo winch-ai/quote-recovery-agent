@@ -19,6 +19,7 @@ from langgraph.types import Command
 
 from winch.channels.whatsapp import WhatsAppChannel
 from winch.compose import ContractorProfile
+from winch.concierge import handle_general_message
 from winch.config import Settings
 from winch.db import init_schema, make_pool
 from winch.graph import Entry, build_graph
@@ -29,6 +30,7 @@ from winch.repository import (
     PostgresContactWindow,
     PostgresDeduplicator,
     PostgresEventSink,
+    PostgresReporting,
     PostgresThreadIndex,
     PostgresTouchpointQueue,
 )
@@ -73,6 +75,9 @@ class Runtime:
         self.queue = None
         self.events = None
         self.threads = None
+        self.reporting = None
+        self.contractor_profile = None
+        self.text_llm = None
 
     async def start(self) -> None:
         s = self.settings
@@ -83,6 +88,7 @@ class Runtime:
         self.events = PostgresEventSink(self.pool)
         self.deduplicator = PostgresDeduplicator(self.pool)
         self.threads = PostgresThreadIndex(self.pool)
+        self.reporting = PostgresReporting(self.pool)
         self.contact_window = PostgresContactWindow(self.pool)
 
         channel = WhatsAppChannel(
@@ -97,19 +103,21 @@ class Runtime:
                                s.azure_deployment, s.azure_api_version)
 
         self.contractor_channel = channel
+        self.text_llm = text
+        self.contractor_profile = ContractorProfile(
+            contractor_id="pilot",
+            first_name=s.contractor_first_name,
+            business_name=s.contractor_business_name,
+            wa_id=s.contractor_wa_id,
+            timezone=s.contractor_timezone,
+        )
         deps = Deps(
             llm=_CombinedLLM(extractor, text),
             channel=channel,
             contractor_channel=channel,
             events=self.events,
             queue=self.queue,
-            contractor=ContractorProfile(
-                contractor_id="pilot",
-                first_name=s.contractor_first_name,
-                business_name=s.contractor_business_name,
-                wa_id=s.contractor_wa_id,
-                timezone=s.contractor_timezone,
-            ),
+            contractor=self.contractor_profile,
             media_fetch=channel.download_media,
         )
 
@@ -320,13 +328,23 @@ async def _route_event(runtime: Runtime, settings: Settings, event: ParsedEvent)
             # message unanswered is not - a contractor typing "are you there?"
             # and hearing nothing back is indistinguishable from the product
             # being broken, which is exactly the failure mode this whole
-            # product exists to prevent for THEIR customers. Say something.
-            logger.info("contractor message with no pending interrupt; acknowledging")
-            await runtime.contractor_channel.send_freeform(
-                event.from_wa_id,
-                "Nothing outstanding right now - forward a quote whenever "
-                "you're ready and I'll take it from there.",
+            # product exists to prevent for THEIR customers. Hand this off to
+            # the concierge (winch.concierge) - a read-only LLM-with-tools
+            # agent that can answer status questions grounded in real data,
+            # rather than a single hardcoded line regardless of what was
+            # asked. It cannot send, approve, schedule, or create a quote;
+            # those still require forwarding the document through the
+            # deterministic intake path above.
+            logger.info("contractor message with no pending interrupt; asking concierge")
+            reply = await handle_general_message(
+                text=event.text or event.button_payload or "",
+                contractor=runtime.contractor_profile,
+                threads=runtime.threads,
+                reporting=runtime.reporting,
+                graph=runtime.graph,
+                llm=runtime.text_llm,
             )
+            await runtime.contractor_channel.send_freeform(event.from_wa_id, reply)
             return
         result = await runtime.graph.ainvoke(
             Command(resume=_parse_contractor_reply(event)),

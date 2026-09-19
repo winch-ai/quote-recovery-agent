@@ -494,6 +494,46 @@ class AzureTextClient:
         except Exception:
             return False
 
+    async def chat_with_tools(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """One turn of a tool-calling loop. Returns the raw assistant message
+        (may contain `tool_calls` and/or `content`) so the caller drives the
+        loop and decides when to stop - this method makes no looping or
+        tool-execution decisions of its own.
+
+        Used only by winch.concierge for read-only contractor Q&A. MUST NOT be
+        used anywhere a tool could mutate money, timing, or send state - those
+        stay on the deterministic supervisor path."""
+        url = self._build_url()
+        headers = {
+            "Content-Type": "application/json",
+            "api-key": self.api_key,
+        }
+        body = {
+            "messages": messages,
+            "tools": tools,
+            "max_completion_tokens": 500,
+        }
+
+        if self.http_client is not None:
+            response = await self._send_with_retries(self.http_client, url, headers, body)
+        else:
+            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+                response = await self._send_with_retries(client, url, headers, body)
+
+        try:
+            data = response.json()
+        except Exception as exc:
+            msg = self._scrub(str(exc))
+            raise RuntimeError(f"Failed to parse response JSON: {msg}") from None
+
+        try:
+            return data["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError) as exc:
+            msg = self._scrub(str(exc))
+            raise RuntimeError(f"Malformed LLM response structure: {msg}") from None
+
     async def compose_reply(self, quote: Quote, customer_message: str) -> str:
         url = self._build_url()
         headers = {

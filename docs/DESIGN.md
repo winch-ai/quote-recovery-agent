@@ -147,6 +147,25 @@ An unsubscribe routes to `archive`, not `alert`: it must not ping the contractor
 as though the customer asked a question, and it must skip the remaining
 touchpoints.
 
+### The concierge — outside the graph, on purpose
+
+Before a contractor's non-media message resumed a pending interrupt or was
+recorded, a plain-text message with nothing pending got one hardcoded
+acknowledgement regardless of content. Real usage showed the gap: "what's
+pending", "how many went out this week", "create an invoice" all produced the
+same unhelpful reply.
+
+`winch/concierge.py` fixes this without touching the table above: it is a
+small, uncheckpointed LangGraph ReAct loop (`agent` ⇄ `tools`, capped at
+`MAX_TOOL_TURNS`) invoked only when `_route_event` finds no pending thread for
+a contractor message. Its tools are read-only — `list_pending_quotes` (from
+`quote_threads` + live graph state) and `count_recent_activity` (from the
+`events` log) — and it has no tool that can send, approve, schedule, or
+create a quote. Creating one still requires forwarding the document; the
+concierge's job is only to say so when asked otherwise. Any failure (LLM
+error, runaway loop, tool exception) degrades to the original safe
+acknowledgement string rather than crashing message handling.
+
 ### Gate design — deliberately strict for v1
 
 `gate` is a **hard `interrupt()` on every outbound**, even though the assessment argues front-loaded

@@ -190,6 +190,34 @@ class PostgresEventSink:
                 )
 
 
+class PostgresReporting:
+    """Read-only aggregate queries over the event log.
+
+    Separate from PostgresEventSink (which only satisfies the write-only
+    EventSink protocol) so a reporting bug can never touch the append path
+    that the pilot's headline metric depends on. Used only by
+    winch.concierge for contractor status questions.
+    """
+
+    def __init__(self, pool: AsyncConnectionPool) -> None:
+        self._pool = pool
+
+    async def count_events_since(self, event_type: EventType, since: datetime) -> int:
+        event_type_str = event_type.value if hasattr(event_type, "value") else str(event_type)
+        since_param = since if since.tzinfo is not None else since.replace(tzinfo=timezone.utc)
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT count(*) FROM events
+                    WHERE event_type = %s AND at >= %s;
+                    """,
+                    (event_type_str, since_param),
+                )
+                row = await cur.fetchone()
+                return int(row[0]) if row is not None else 0
+
+
 class PostgresContactWindow:
     """Tracks the last time each WhatsApp number messaged us.
 
@@ -345,6 +373,27 @@ class PostgresThreadIndex:
                     """,
                     (provider_message_id, quote_id),
                 )
+
+    async def list_awaiting(self) -> list[str]:
+        """quote_ids currently waiting on a contractor answer, most recent first.
+
+        Read-only reporting query for winch.concierge - the contractor's own
+        "what's pending" is answered from here, not from pending_thread()'s
+        single-result "most recent" semantics, which exist for reply
+        resolution and would silently hide every quote but one.
+        """
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT quote_id
+                    FROM quote_threads
+                    WHERE awaiting = true AND closed = false
+                    ORDER BY updated_at DESC;
+                    """
+                )
+                rows = await cur.fetchall()
+                return [row[0] for row in rows]
 
     async def resolve_reply(self, reply_to_message_id: str | None) -> str | None:
         """Look up the quote a swipe-reply is about, if it was a reply at all.
