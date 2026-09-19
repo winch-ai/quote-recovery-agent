@@ -84,7 +84,7 @@ async def test_init_schema_is_idempotent(pool):
             await cur.execute(
                 """
                 SELECT table_name FROM information_schema.tables
-                WHERE table_schema = 'public'
+                WHERE table_schema = current_schema()
                   AND table_name IN ('touchpoints', 'processed_messages', 'events');
                 """
             )
